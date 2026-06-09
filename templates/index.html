@@ -1,0 +1,644 @@
+<!DOCTYPE html>
+<html lang="ru">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Lyrics Sync — Синхронизация текста с аудио</title>
+    <style>
+        *, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
+
+        :root {
+            --bg: #0f0f13;
+            --surface: #1a1a24;
+            --surface-hover: #22222f;
+            --border: #2a2a3a;
+            --primary: #7c5cfc;
+            --primary-hover: #6a48e6;
+            --text: #e4e4ef;
+            --text-muted: #8888a0;
+            --success: #34d399;
+            --error: #f87171;
+            --radius: 12px;
+        }
+
+        body {
+            font-family: 'Segoe UI', system-ui, -apple-system, sans-serif;
+            background: var(--bg);
+            color: var(--text);
+            min-height: 100vh;
+            display: flex;
+            flex-direction: column;
+            align-items: center;
+            padding: 40px 20px;
+        }
+
+        h1 {
+            font-size: 2rem;
+            font-weight: 700;
+            margin-bottom: 8px;
+            background: linear-gradient(135deg, var(--primary), #c084fc);
+            -webkit-background-clip: text;
+            -webkit-text-fill-color: transparent;
+        }
+
+        .subtitle {
+            color: var(--text-muted);
+            margin-bottom: 40px;
+            font-size: 1rem;
+        }
+
+        .container {
+            width: 100%;
+            max-width: 800px;
+            display: flex;
+            flex-direction: column;
+            gap: 24px;
+        }
+
+        .card {
+            background: var(--surface);
+            border: 1px solid var(--border);
+            border-radius: var(--radius);
+            padding: 24px;
+        }
+
+        .card-title {
+            font-size: 0.85rem;
+            font-weight: 600;
+            text-transform: uppercase;
+            letter-spacing: 0.05em;
+            color: var(--text-muted);
+            margin-bottom: 16px;
+        }
+
+        /* File upload */
+        .drop-zone {
+            border: 2px dashed var(--border);
+            border-radius: var(--radius);
+            padding: 40px 20px;
+            text-align: center;
+            cursor: pointer;
+            transition: all 0.2s;
+            position: relative;
+        }
+
+        .drop-zone:hover, .drop-zone.dragover {
+            border-color: var(--primary);
+            background: rgba(124, 92, 252, 0.05);
+        }
+
+        .drop-zone input[type="file"] {
+            position: absolute;
+            inset: 0;
+            opacity: 0;
+            cursor: pointer;
+        }
+
+        .drop-zone-icon {
+            font-size: 2.5rem;
+            margin-bottom: 12px;
+            opacity: 0.6;
+        }
+
+        .drop-zone-text {
+            color: var(--text-muted);
+            font-size: 0.95rem;
+        }
+
+        .drop-zone-text strong {
+            color: var(--primary);
+        }
+
+        .file-selected {
+            display: none;
+            align-items: center;
+            gap: 12px;
+            padding: 12px 16px;
+            background: rgba(124, 92, 252, 0.1);
+            border-radius: 8px;
+            margin-top: 12px;
+            font-size: 0.9rem;
+        }
+
+        .file-selected.visible { display: flex; }
+
+        .file-selected .file-name {
+            flex: 1;
+            overflow: hidden;
+            text-overflow: ellipsis;
+            white-space: nowrap;
+        }
+
+        .file-selected .file-remove {
+            background: none;
+            border: none;
+            color: var(--text-muted);
+            cursor: pointer;
+            font-size: 1.2rem;
+            padding: 0 4px;
+        }
+
+        .file-selected .file-remove:hover { color: var(--error); }
+
+        /* Select */
+        select {
+            width: 100%;
+            padding: 12px 16px;
+            background: var(--bg);
+            border: 1px solid var(--border);
+            border-radius: 8px;
+            color: var(--text);
+            font-family: 'Segoe UI', system-ui, sans-serif;
+            font-size: 0.95rem;
+            cursor: pointer;
+            transition: border-color 0.2s;
+            appearance: none;
+            background-image: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='12' height='12' viewBox='0 0 12 12'%3E%3Cpath fill='%238888a0' d='M6 8L1 3h10z'/%3E%3C/svg%3E");
+            background-repeat: no-repeat;
+            background-position: right 16px center;
+        }
+
+        select:focus {
+            outline: none;
+            border-color: var(--primary);
+        }
+
+        select option {
+            background: var(--surface);
+            color: var(--text);
+        }
+
+        /* Textarea */
+        textarea {
+            width: 100%;
+            min-height: 250px;
+            background: var(--bg);
+            border: 1px solid var(--border);
+            border-radius: 8px;
+            padding: 16px;
+            color: var(--text);
+            font-family: 'Consolas', 'Courier New', monospace;
+            font-size: 0.9rem;
+            line-height: 1.7;
+            resize: vertical;
+            transition: border-color 0.2s;
+        }
+
+        textarea:focus {
+            outline: none;
+            border-color: var(--primary);
+        }
+
+        textarea::placeholder {
+            color: var(--text-muted);
+            opacity: 0.6;
+        }
+
+        /* Button */
+        .btn-primary {
+            width: 100%;
+            padding: 16px;
+            background: var(--primary);
+            color: #fff;
+            border: none;
+            border-radius: var(--radius);
+            font-size: 1rem;
+            font-weight: 600;
+            cursor: pointer;
+            transition: all 0.2s;
+            letter-spacing: 0.02em;
+        }
+
+        .btn-primary:hover:not(:disabled) {
+            background: var(--primary-hover);
+            transform: translateY(-1px);
+        }
+
+        .btn-primary:disabled {
+            opacity: 0.5;
+            cursor: not-allowed;
+        }
+
+        /* Progress */
+        .progress-container {
+            display: none;
+            flex-direction: column;
+            align-items: center;
+            gap: 16px;
+            padding: 32px;
+        }
+
+        .progress-container.visible { display: flex; }
+
+        .spinner {
+            width: 48px;
+            height: 48px;
+            border: 4px solid var(--border);
+            border-top-color: var(--primary);
+            border-radius: 50%;
+            animation: spin 0.8s linear infinite;
+        }
+
+        @keyframes spin { to { transform: rotate(360deg); } }
+
+        .progress-text {
+            color: var(--text-muted);
+            font-size: 0.95rem;
+            text-align: center;
+        }
+
+        /* Result */
+        .result-container {
+            display: none;
+            flex-direction: column;
+            gap: 16px;
+        }
+
+        .result-container.visible { display: flex; }
+
+        .result-header {
+            display: flex;
+            align-items: center;
+            justify-content: space-between;
+            flex-wrap: wrap;
+            gap: 12px;
+        }
+
+        .result-badge {
+            display: inline-flex;
+            align-items: center;
+            gap: 6px;
+            color: var(--success);
+            font-weight: 600;
+            font-size: 0.95rem;
+        }
+
+        .btn-download {
+            padding: 10px 20px;
+            background: transparent;
+            border: 1px solid var(--primary);
+            color: var(--primary);
+            border-radius: 8px;
+            font-size: 0.9rem;
+            font-weight: 600;
+            cursor: pointer;
+            transition: all 0.2s;
+            text-decoration: none;
+        }
+
+        .btn-download:hover {
+            background: var(--primary);
+            color: #fff;
+        }
+
+        .srt-preview {
+            background: var(--bg);
+            border: 1px solid var(--border);
+            border-radius: 8px;
+            padding: 20px;
+            font-family: 'Consolas', 'Courier New', monospace;
+            font-size: 0.85rem;
+            line-height: 1.8;
+            white-space: pre-wrap;
+            max-height: 500px;
+            overflow-y: auto;
+            color: var(--text-muted);
+        }
+
+        .srt-preview .srt-index {
+            color: var(--primary);
+            font-weight: 700;
+        }
+
+        .srt-preview .srt-time {
+            color: var(--success);
+        }
+
+        .srt-preview .srt-text {
+            color: var(--text);
+        }
+
+        /* Error */
+        .error-message {
+            display: none;
+            padding: 16px;
+            background: rgba(248, 113, 113, 0.1);
+            border: 1px solid rgba(248, 113, 113, 0.3);
+            border-radius: 8px;
+            color: var(--error);
+            font-size: 0.9rem;
+        }
+
+        .error-message.visible { display: block; }
+
+        /* Footer */
+        footer {
+            margin-top: 60px;
+            color: var(--text-muted);
+            font-size: 0.8rem;
+            opacity: 0.5;
+        }
+
+        /* Scrollbar */
+        ::-webkit-scrollbar { width: 6px; }
+        ::-webkit-scrollbar-track { background: transparent; }
+        ::-webkit-scrollbar-thumb { background: var(--border); border-radius: 3px; }
+        ::-webkit-scrollbar-thumb:hover { background: var(--text-muted); }
+
+        .lyrics-grid {
+            display: grid;
+            gap: 16px;
+        }
+
+        @media (min-width: 900px) {
+            .lyrics-grid {
+                grid-template-columns: repeat(3, 1fr);
+            }
+        }
+
+        .lyrics-field label {
+            display: block;
+            font-size: 0.8rem;
+            font-weight: 600;
+            color: var(--text-muted);
+            margin-bottom: 8px;
+        }
+
+        .lyrics-field label .req {
+            color: var(--error);
+        }
+
+        .lyrics-field textarea {
+            min-height: 220px;
+        }
+
+        .result-columns {
+            display: grid;
+            gap: 16px;
+            margin-top: 16px;
+        }
+
+        @media (min-width: 900px) {
+            .result-columns {
+                grid-template-columns: repeat(3, 1fr);
+            }
+        }
+
+        .preview-col {
+            display: flex;
+            flex-direction: column;
+            min-width: 0;
+        }
+
+        .preview-col-title {
+            font-size: 0.75rem;
+            font-weight: 700;
+            text-transform: uppercase;
+            letter-spacing: 0.08em;
+            color: var(--primary);
+            margin-bottom: 8px;
+        }
+
+        .preview-col .srt-preview {
+            flex: 1;
+            min-height: 200px;
+            max-height: 420px;
+        }
+
+        .result-downloads {
+            display: flex;
+            flex-wrap: wrap;
+            gap: 10px;
+            align-items: center;
+        }
+    </style>
+</head>
+<body>
+    <h1>Lyrics Sync</h1>
+    <p class="subtitle">Автоматическая синхронизация текста песни с аудио</p>
+
+    <div class="container">
+        <div class="card">
+            <div class="card-title">1. Загрузите MP3 файл</div>
+            <div class="drop-zone" id="dropZone">
+                <input type="file" id="audioFile" accept=".mp3,.wav,.m4a,.ogg,.flac">
+                <div class="drop-zone-icon">🎵</div>
+                <div class="drop-zone-text">
+                    Перетащите файл сюда или <strong>нажмите для выбора</strong>
+                </div>
+            </div>
+            <div class="file-selected" id="fileSelected">
+                <span>🎧</span>
+                <span class="file-name" id="fileName"></span>
+                <button class="file-remove" id="fileRemove" title="Удалить">&times;</button>
+            </div>
+        </div>
+
+        <div class="card">
+            <div class="card-title">2. Выберите язык песни</div>
+            <select id="language">
+                <option value="fr" selected>Французский</option>
+                <option value="en">Английский</option>
+                <option value="ru">Русский</option>
+                <option value="es">Испанский</option>
+                <option value="de">Немецкий</option>
+                <option value="it">Итальянский</option>
+                <option value="pt">Португальский</option>
+                <option value="ja">Японский</option>
+                <option value="ko">Корейский</option>
+                <option value="zh">Китайский</option>
+            </select>
+        </div>
+
+        <div class="card">
+            <div class="card-title">3. Тексты построчно (одинаковое число строк во всех полях)</div>
+            <p style="color: var(--text-muted); font-size: 0.9rem; margin-bottom: 16px;">
+                Для расчёта таймингов используется только <strong>FR</strong>. RU и TR получают те же метки времени, что и соответствующая строка FR.
+            </p>
+            <div class="lyrics-grid">
+                <div class="lyrics-field">
+                    <label for="lyricsFr">FR <span class="req">*</span> — французский</label>
+                    <textarea
+                        id="lyricsFr"
+                        placeholder="Французский текст...&#10;По строкам как в песне."
+                    ></textarea>
+                </div>
+                <div class="lyrics-field">
+                    <label for="lyricsRu">RU — русский (столько же строк, что и во FR)</label>
+                    <textarea
+                        id="lyricsRu"
+                        placeholder="Перевод на русский...&#10;Строка к строке с FR."
+                    ></textarea>
+                </div>
+                <div class="lyrics-field">
+                    <label for="lyricsTr">TR — транскрипция (столько же строк, что и во FR)</label>
+                    <textarea
+                        id="lyricsTr"
+                        placeholder="Транскрипция...&#10;Строка к строке с FR."
+                    ></textarea>
+                </div>
+            </div>
+        </div>
+
+        <button class="btn-primary" id="btnAlign" disabled>
+            Синхронизировать
+        </button>
+
+        <div class="progress-container" id="progress">
+            <div class="spinner"></div>
+            <div class="progress-text">
+                Выполняется синхронизация...<br>
+                <small>Это может занять 30–90 секунд в зависимости от длины трека</small>
+            </div>
+        </div>
+
+        <div class="error-message" id="errorMsg"></div>
+
+        <div class="result-container" id="result">
+            <div class="card">
+                <div class="result-header">
+                    <span class="result-badge">✓ Синхронизация завершена</span>
+                    <div class="result-downloads">
+                        <a class="btn-download" id="btnDownloadFr" href="#" download="lyrics-fr.lrc">FR · LRC</a>
+                        <a class="btn-download" id="btnDownloadRu" href="#" download="lyrics-ru.lrc">RU · LRC</a>
+                        <a class="btn-download" id="btnDownloadTr" href="#" download="lyrics-tr.lrc">TR · LRC</a>
+                    </div>
+                </div>
+                <div class="result-columns">
+                    <div class="preview-col">
+                        <div class="preview-col-title">FR</div>
+                        <div class="srt-preview" id="lrcPreviewFr"></div>
+                    </div>
+                    <div class="preview-col">
+                        <div class="preview-col-title">RU</div>
+                        <div class="srt-preview" id="lrcPreviewRu"></div>
+                    </div>
+                    <div class="preview-col">
+                        <div class="preview-col-title">TR</div>
+                        <div class="srt-preview" id="lrcPreviewTr"></div>
+                    </div>
+                </div>
+            </div>
+        </div>
+    </div>
+
+    <footer>Whisper AI · stable-ts · forced alignment</footer>
+
+    <script>
+        const dropZone = document.getElementById('dropZone');
+        const audioInput = document.getElementById('audioFile');
+        const fileSelected = document.getElementById('fileSelected');
+        const fileName = document.getElementById('fileName');
+        const fileRemove = document.getElementById('fileRemove');
+        const lyricsFr = document.getElementById('lyricsFr');
+        const lyricsRu = document.getElementById('lyricsRu');
+        const lyricsTr = document.getElementById('lyricsTr');
+        const btnAlign = document.getElementById('btnAlign');
+        const progress = document.getElementById('progress');
+        const errorMsg = document.getElementById('errorMsg');
+        const result = document.getElementById('result');
+        const lrcPreviewFr = document.getElementById('lrcPreviewFr');
+        const lrcPreviewRu = document.getElementById('lrcPreviewRu');
+        const lrcPreviewTr = document.getElementById('lrcPreviewTr');
+        const btnDownloadFr = document.getElementById('btnDownloadFr');
+        const btnDownloadRu = document.getElementById('btnDownloadRu');
+        const btnDownloadTr = document.getElementById('btnDownloadTr');
+
+        let selectedFile = null;
+
+        function updateButtonState() {
+            btnAlign.disabled = !(selectedFile && lyricsFr.value.trim());
+        }
+
+        function showFile(file) {
+            selectedFile = file;
+            fileName.textContent = file.name;
+            fileSelected.classList.add('visible');
+            updateButtonState();
+        }
+
+        function clearFile() {
+            selectedFile = null;
+            audioInput.value = '';
+            fileSelected.classList.remove('visible');
+            updateButtonState();
+        }
+
+        dropZone.addEventListener('dragover', (e) => {
+            e.preventDefault();
+            dropZone.classList.add('dragover');
+        });
+
+        dropZone.addEventListener('dragleave', () => {
+            dropZone.classList.remove('dragover');
+        });
+
+        dropZone.addEventListener('drop', (e) => {
+            e.preventDefault();
+            dropZone.classList.remove('dragover');
+            const file = e.dataTransfer.files[0];
+            if (file) showFile(file);
+        });
+
+        audioInput.addEventListener('change', () => {
+            if (audioInput.files[0]) showFile(audioInput.files[0]);
+        });
+
+        fileRemove.addEventListener('click', clearFile);
+        [lyricsFr, lyricsRu, lyricsTr].forEach((el) =>
+            el.addEventListener('input', updateButtonState)
+        );
+
+        function highlightLrc(raw) {
+            return raw.replace(
+                /^(\[[\d:.]+\])(.*)$/gm,
+                '<span class="srt-time">$1</span><span class="srt-text">$2</span>'
+            );
+        }
+
+        btnAlign.addEventListener('click', async () => {
+            if (!selectedFile || !lyricsFr.value.trim()) return;
+
+            btnAlign.disabled = true;
+            progress.classList.add('visible');
+            errorMsg.classList.remove('visible');
+            result.classList.remove('visible');
+
+            const formData = new FormData();
+            formData.append('audio', selectedFile);
+            formData.append('lyrics_fr', lyricsFr.value);
+            formData.append('lyrics_ru', lyricsRu.value);
+            formData.append('lyrics_tr', lyricsTr.value);
+            formData.append('language', document.getElementById('language').value);
+
+            try {
+                const response = await fetch('/align', {
+                    method: 'POST',
+                    body: formData,
+                });
+
+                const data = await response.json();
+
+                if (!response.ok) {
+                    throw new Error(data.error || 'Неизвестная ошибка');
+                }
+
+                const id = data.download_id;
+                lrcPreviewFr.innerHTML = highlightLrc(data.lrc_fr);
+                lrcPreviewRu.innerHTML = highlightLrc(data.lrc_ru);
+                lrcPreviewTr.innerHTML = highlightLrc(data.lrc_tr);
+                btnDownloadFr.href = `/download/${id}/fr`;
+                btnDownloadRu.href = `/download/${id}/ru`;
+                btnDownloadTr.href = `/download/${id}/tr`;
+                result.classList.add('visible');
+            } catch (err) {
+                errorMsg.textContent = err.message;
+                errorMsg.classList.add('visible');
+            } finally {
+                progress.classList.remove('visible');
+                btnAlign.disabled = false;
+            }
+        });
+    </script>
+</body>
+</html>

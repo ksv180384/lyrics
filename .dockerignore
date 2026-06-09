@@ -1,0 +1,8 @@
+.venv
+.git
+.idea
+__pycache__
+*.pyc
+uploads
+*.lrc
+*.srt

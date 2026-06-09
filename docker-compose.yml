@@ -1,0 +1,44 @@
+services:
+  liryc:
+    build:
+      context: .
+      target: cpu
+    ports:
+      - "5555:5555"
+    environment:
+      WHISPER_MODEL: ${WHISPER_MODEL:-medium}
+      WHISPER_DOWNLOAD_ROOT: /models
+    volumes:
+      - ./uploads:/app/uploads
+      - whisper-models:/models
+    restart: unless-stopped
+
+  liryc-gpu:
+    profiles:
+      - gpu
+    build:
+      context: .
+      target: gpu
+    ports:
+      - "5555:5555"
+    environment:
+      WHISPER_MODEL: ${WHISPER_MODEL:-medium}
+      WHISPER_DEVICE: cuda
+      WHISPER_DOWNLOAD_ROOT: /models
+      NVIDIA_VISIBLE_DEVICES: all
+      NVIDIA_DRIVER_CAPABILITIES: compute,utility
+    volumes:
+      - ./uploads:/app/uploads
+      - whisper-models:/models
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: all
+              capabilities:
+                - gpu
+    restart: unless-stopped
+
+volumes:
+  whisper-models:
