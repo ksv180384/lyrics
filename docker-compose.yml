@@ -6,9 +6,11 @@ services:
     ports:
       - "5555:5555"
     environment:
-      WHISPER_MODEL: ${WHISPER_MODEL:-medium}
+      WHISPER_MODEL: ${WHISPER_MODEL:-large-v3-turbo}
       WHISPER_DOWNLOAD_ROOT: /models
     volumes:
+      - ./app.py:/app/app.py:ro
+      - ./templates:/app/templates:ro
       - ./uploads:/app/uploads
       - whisper-models:/models
     restart: unless-stopped
@@ -22,12 +24,14 @@ services:
     ports:
       - "5555:5555"
     environment:
-      WHISPER_MODEL: ${WHISPER_MODEL:-medium}
+      WHISPER_MODEL: ${WHISPER_MODEL:-large-v3-turbo}
       WHISPER_DEVICE: cuda
       WHISPER_DOWNLOAD_ROOT: /models
       NVIDIA_VISIBLE_DEVICES: all
       NVIDIA_DRIVER_CAPABILITIES: compute,utility
     volumes:
+      - ./app.py:/app/app.py:ro
+      - ./templates:/app/templates:ro
       - ./uploads:/app/uploads
       - whisper-models:/models
     deploy:

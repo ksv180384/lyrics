@@ -31,6 +31,8 @@ ENV DEBIAN_FRONTEND=noninteractive \
     PYTHONDONTWRITEBYTECODE=1 \
     PYTHONUNBUFFERED=1 \
     PIP_NO_CACHE_DIR=1 \
+    PIP_DEFAULT_TIMEOUT=120 \
+    PIP_RETRIES=10 \
     WHISPER_DEVICE=cuda \
     WHISPER_DOWNLOAD_ROOT=/models
 
@@ -44,7 +46,7 @@ RUN apt-get update \
 
 COPY requirements.txt .
 RUN pip install --upgrade pip \
-    && pip install torch torchvision torchaudio --index-url https://download.pytorch.org/whl/cu121 \
+    && pip install torch==2.5.1+cu121 torchaudio==2.5.1+cu121 --index-url https://download.pytorch.org/whl/cu121 \
     && pip install -r requirements.txt
 
 COPY app.py ./app.py

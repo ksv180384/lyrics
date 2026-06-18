@@ -140,8 +140,32 @@
 
         .file-selected .file-remove:hover { color: var(--error); }
 
-        /* Select */
-        select {
+        .song-meta-grid {
+            display: grid;
+            gap: 16px;
+        }
+
+        @media (min-width: 700px) {
+            .song-meta-grid {
+                grid-template-columns: repeat(2, 1fr);
+            }
+        }
+
+        .meta-field label {
+            display: block;
+            font-size: 0.8rem;
+            font-weight: 600;
+            color: var(--text-muted);
+            margin-bottom: 8px;
+        }
+
+        .meta-field label .req {
+            color: var(--error);
+        }
+
+        /* Select and inputs */
+        select,
+        input[type="text"] {
             width: 100%;
             padding: 12px 16px;
             background: var(--bg);
@@ -161,6 +185,16 @@
         select:focus {
             outline: none;
             border-color: var(--primary);
+        }
+
+        input[type="text"]:focus {
+            outline: none;
+            border-color: var(--primary);
+        }
+
+        input[type="text"]::placeholder {
+            color: var(--text-muted);
+            opacity: 0.6;
         }
 
         select option {
@@ -396,7 +430,36 @@
             text-transform: uppercase;
             letter-spacing: 0.08em;
             color: var(--primary);
+        }
+
+        .preview-col-header {
+            display: flex;
+            align-items: center;
+            justify-content: space-between;
+            gap: 10px;
             margin-bottom: 8px;
+        }
+
+        .btn-copy {
+            padding: 6px 10px;
+            background: transparent;
+            border: 1px solid var(--border);
+            color: var(--text-muted);
+            border-radius: 8px;
+            font-size: 0.75rem;
+            font-weight: 700;
+            cursor: pointer;
+            transition: all 0.2s;
+        }
+
+        .btn-copy:hover {
+            border-color: var(--primary);
+            color: var(--text);
+        }
+
+        .btn-copy.copied {
+            border-color: var(--success);
+            color: var(--success);
         }
 
         .preview-col .srt-preview {
@@ -410,6 +473,45 @@
             flex-wrap: wrap;
             gap: 10px;
             align-items: center;
+        }
+
+        .saved-song-controls {
+            display: grid;
+            gap: 12px;
+        }
+
+        @media (min-width: 700px) {
+            .saved-song-controls {
+                grid-template-columns: 1fr auto;
+                align-items: end;
+            }
+        }
+
+        .saved-song-search {
+            margin-bottom: 12px;
+        }
+
+        .btn-secondary {
+            padding: 12px 18px;
+            background: transparent;
+            border: 1px solid var(--primary);
+            color: var(--primary);
+            border-radius: 8px;
+            font-size: 0.9rem;
+            font-weight: 700;
+            cursor: pointer;
+            transition: all 0.2s;
+            white-space: nowrap;
+        }
+
+        .btn-secondary:hover:not(:disabled) {
+            background: var(--primary);
+            color: #fff;
+        }
+
+        .btn-secondary:disabled {
+            opacity: 0.5;
+            cursor: not-allowed;
         }
     </style>
 </head>
@@ -435,7 +537,21 @@
         </div>
 
         <div class="card">
-            <div class="card-title">2. Выберите язык песни</div>
+            <div class="card-title">2. Данные песни</div>
+            <div class="song-meta-grid">
+                <div class="meta-field">
+                    <label for="artist">Исполнитель <span class="req">*</span></label>
+                    <input type="text" id="artist" placeholder="Carla">
+                </div>
+                <div class="meta-field">
+                    <label for="songTitle">Название песни <span class="req">*</span></label>
+                    <input type="text" id="songTitle" placeholder="Bim bam toi">
+                </div>
+            </div>
+        </div>
+
+        <div class="card">
+            <div class="card-title">3. Выберите язык песни</div>
             <select id="language">
                 <option value="fr" selected>Французский</option>
                 <option value="en">Английский</option>
@@ -451,7 +567,7 @@
         </div>
 
         <div class="card">
-            <div class="card-title">3. Тексты построчно (одинаковое число строк во всех полях)</div>
+            <div class="card-title">4. Тексты построчно (одинаковое число строк во всех полях)</div>
             <p style="color: var(--text-muted); font-size: 0.9rem; margin-bottom: 16px;">
                 Для расчёта таймингов используется только <strong>FR</strong>. RU и TR получают те же метки времени, что и соответствующая строка FR.
             </p>
@@ -494,6 +610,17 @@
 
         <div class="error-message" id="errorMsg"></div>
 
+        <div class="card">
+            <div class="card-title">5. Сохранённые песни</div>
+            <input class="saved-song-search" type="text" id="savedSongSearch" placeholder="Поиск по исполнителю или названию">
+            <div class="saved-song-controls">
+                <select id="savedSongs">
+                    <option value="">Сохранённых песен пока нет</option>
+                </select>
+                <button class="btn-secondary" id="btnLoadSong" type="button" disabled>Просмотреть</button>
+            </div>
+        </div>
+
         <div class="result-container" id="result">
             <div class="card">
                 <div class="result-header">
@@ -506,15 +633,24 @@
                 </div>
                 <div class="result-columns">
                     <div class="preview-col">
-                        <div class="preview-col-title">FR</div>
+                        <div class="preview-col-header">
+                            <div class="preview-col-title">FR</div>
+                            <button class="btn-copy" id="btnCopyFr" type="button" disabled>Копировать</button>
+                        </div>
                         <div class="srt-preview" id="lrcPreviewFr"></div>
                     </div>
                     <div class="preview-col">
-                        <div class="preview-col-title">RU</div>
+                        <div class="preview-col-header">
+                            <div class="preview-col-title">RU</div>
+                            <button class="btn-copy" id="btnCopyRu" type="button" disabled>Копировать</button>
+                        </div>
                         <div class="srt-preview" id="lrcPreviewRu"></div>
                     </div>
                     <div class="preview-col">
-                        <div class="preview-col-title">TR</div>
+                        <div class="preview-col-header">
+                            <div class="preview-col-title">TR</div>
+                            <button class="btn-copy" id="btnCopyTr" type="button" disabled>Копировать</button>
+                        </div>
                         <div class="srt-preview" id="lrcPreviewTr"></div>
                     </div>
                 </div>
@@ -530,6 +666,8 @@
         const fileSelected = document.getElementById('fileSelected');
         const fileName = document.getElementById('fileName');
         const fileRemove = document.getElementById('fileRemove');
+        const artist = document.getElementById('artist');
+        const songTitle = document.getElementById('songTitle');
         const lyricsFr = document.getElementById('lyricsFr');
         const lyricsRu = document.getElementById('lyricsRu');
         const lyricsTr = document.getElementById('lyricsTr');
@@ -543,11 +681,24 @@
         const btnDownloadFr = document.getElementById('btnDownloadFr');
         const btnDownloadRu = document.getElementById('btnDownloadRu');
         const btnDownloadTr = document.getElementById('btnDownloadTr');
+        const btnCopyFr = document.getElementById('btnCopyFr');
+        const btnCopyRu = document.getElementById('btnCopyRu');
+        const btnCopyTr = document.getElementById('btnCopyTr');
+        const savedSongSearch = document.getElementById('savedSongSearch');
+        const savedSongs = document.getElementById('savedSongs');
+        const btnLoadSong = document.getElementById('btnLoadSong');
 
         let selectedFile = null;
+        let latestLrc = { fr: '', ru: '', tr: '' };
+        let allSavedSongs = [];
 
         function updateButtonState() {
-            btnAlign.disabled = !(selectedFile && lyricsFr.value.trim());
+            btnAlign.disabled = !(
+                selectedFile &&
+                artist.value.trim() &&
+                songTitle.value.trim() &&
+                lyricsFr.value.trim()
+            );
         }
 
         function showFile(file) {
@@ -585,10 +736,9 @@
         });
 
         fileRemove.addEventListener('click', clearFile);
-        [lyricsFr, lyricsRu, lyricsTr].forEach((el) =>
+        [artist, songTitle, lyricsFr, lyricsRu, lyricsTr].forEach((el) =>
             el.addEventListener('input', updateButtonState)
         );
-
         function highlightLrc(raw) {
             return raw.replace(
                 /^(\[[\d:.]+\])(.*)$/gm,
@@ -596,8 +746,142 @@
             );
         }
 
+        async function copyText(text) {
+            if (navigator.clipboard && window.isSecureContext) {
+                await navigator.clipboard.writeText(text);
+                return;
+            }
+
+            const textarea = document.createElement('textarea');
+            textarea.value = text;
+            textarea.style.position = 'fixed';
+            textarea.style.opacity = '0';
+            document.body.appendChild(textarea);
+            textarea.focus();
+            textarea.select();
+            document.execCommand('copy');
+            textarea.remove();
+        }
+
+        async function handleCopy(lang, button) {
+            const text = latestLrc[lang];
+            if (!text) return;
+
+            const originalText = button.textContent;
+            try {
+                await copyText(text);
+                button.textContent = 'Скопировано';
+                button.classList.add('copied');
+                setTimeout(() => {
+                    button.textContent = originalText;
+                    button.classList.remove('copied');
+                }, 1400);
+            } catch (err) {
+                button.textContent = 'Ошибка';
+                setTimeout(() => {
+                    button.textContent = originalText;
+                }, 1400);
+            }
+        }
+
+        btnCopyFr.addEventListener('click', () => handleCopy('fr', btnCopyFr));
+        btnCopyRu.addEventListener('click', () => handleCopy('ru', btnCopyRu));
+        btnCopyTr.addEventListener('click', () => handleCopy('tr', btnCopyTr));
+
+        function renderResult(data) {
+            const id = data.download_id;
+            latestLrc = {
+                fr: data.lrc_fr,
+                ru: data.lrc_ru,
+                tr: data.lrc_tr,
+            };
+            lrcPreviewFr.innerHTML = highlightLrc(data.lrc_fr);
+            lrcPreviewRu.innerHTML = highlightLrc(data.lrc_ru);
+            lrcPreviewTr.innerHTML = highlightLrc(data.lrc_tr);
+            btnDownloadFr.href = `/download/${id}/fr`;
+            btnDownloadRu.href = `/download/${id}/ru`;
+            btnDownloadTr.href = `/download/${id}/tr`;
+            btnCopyFr.disabled = false;
+            btnCopyRu.disabled = false;
+            btnCopyTr.disabled = false;
+            result.classList.add('visible');
+        }
+
+        function setSavedSongs(songs, emptyText = 'Сохранённых песен пока нет') {
+            savedSongs.innerHTML = '';
+            if (!songs.length) {
+                const option = document.createElement('option');
+                option.value = '';
+                option.textContent = emptyText;
+                savedSongs.appendChild(option);
+                btnLoadSong.disabled = true;
+                return;
+            }
+
+            songs.forEach((song) => {
+                const option = document.createElement('option');
+                option.value = song.id;
+                option.textContent = `${song.label} · ${song.duration_text}`;
+                savedSongs.appendChild(option);
+            });
+            btnLoadSong.disabled = false;
+        }
+
+        function filterSavedSongs() {
+            const query = savedSongSearch.value.trim().toLowerCase();
+            if (!query) {
+                setSavedSongs(allSavedSongs);
+                return;
+            }
+
+            const filtered = allSavedSongs.filter((song) => {
+                const haystack = [
+                    song.artist,
+                    song.title,
+                    song.label,
+                    song.duration_text,
+                ].join(' ').toLowerCase();
+                return haystack.includes(query);
+            });
+            setSavedSongs(filtered, 'Ничего не найдено');
+        }
+
+        async function loadSavedSongs(selectId = '') {
+            try {
+                const response = await fetch('/songs');
+                const data = await response.json();
+                if (!response.ok) throw new Error(data.error || 'Не удалось загрузить список песен');
+                allSavedSongs = data.songs || [];
+                filterSavedSongs();
+                if (selectId) savedSongs.value = selectId;
+            } catch (err) {
+                errorMsg.textContent = err.message;
+                errorMsg.classList.add('visible');
+            }
+        }
+
+        async function loadSong(id) {
+            if (!id) return;
+            try {
+                const response = await fetch(`/songs/${id}`);
+                const data = await response.json();
+                if (!response.ok) throw new Error(data.error || 'Не удалось открыть песню');
+                renderResult(data);
+                errorMsg.classList.remove('visible');
+            } catch (err) {
+                errorMsg.textContent = err.message;
+                errorMsg.classList.add('visible');
+            }
+        }
+
+        btnLoadSong.addEventListener('click', () => loadSong(savedSongs.value));
+        savedSongs.addEventListener('change', () => {
+            btnLoadSong.disabled = !savedSongs.value;
+        });
+        savedSongSearch.addEventListener('input', filterSavedSongs);
+
         btnAlign.addEventListener('click', async () => {
-            if (!selectedFile || !lyricsFr.value.trim()) return;
+            if (!selectedFile || !artist.value.trim() || !songTitle.value.trim() || !lyricsFr.value.trim()) return;
 
             btnAlign.disabled = true;
             progress.classList.add('visible');
@@ -606,6 +890,8 @@
 
             const formData = new FormData();
             formData.append('audio', selectedFile);
+            formData.append('artist', artist.value);
+            formData.append('title', songTitle.value);
             formData.append('lyrics_fr', lyricsFr.value);
             formData.append('lyrics_ru', lyricsRu.value);
             formData.append('lyrics_tr', lyricsTr.value);
@@ -623,14 +909,8 @@
                     throw new Error(data.error || 'Неизвестная ошибка');
                 }
 
-                const id = data.download_id;
-                lrcPreviewFr.innerHTML = highlightLrc(data.lrc_fr);
-                lrcPreviewRu.innerHTML = highlightLrc(data.lrc_ru);
-                lrcPreviewTr.innerHTML = highlightLrc(data.lrc_tr);
-                btnDownloadFr.href = `/download/${id}/fr`;
-                btnDownloadRu.href = `/download/${id}/ru`;
-                btnDownloadTr.href = `/download/${id}/tr`;
-                result.classList.add('visible');
+                renderResult(data);
+                await loadSavedSongs(data.download_id);
             } catch (err) {
                 errorMsg.textContent = err.message;
                 errorMsg.classList.add('visible');
@@ -639,6 +919,8 @@
                 btnAlign.disabled = false;
             }
         });
+
+        loadSavedSongs();
     </script>
 </body>
 </html>
