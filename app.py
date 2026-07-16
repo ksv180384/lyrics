@@ -1,9 +1,12 @@
 import json
 import os
 import re
+import statistics
 import subprocess
+import unicodedata
 import uuid
 import traceback
+from difflib import SequenceMatcher
 from datetime import datetime, timezone
 
 from flask import Flask, render_template, request, jsonify, send_file
@@ -24,6 +27,7 @@ model = None
 
 
 def get_model():
+    """Лениво загружает модель Whisper при первом обращении и повторно использует её."""
     global model
     if model is None:
         load_options = {}
@@ -37,6 +41,7 @@ def get_model():
 
 
 def format_lrc_timestamp(seconds: float) -> str:
+    """Преобразует секунды в временную метку LRC формата [мм:сс.сс]."""
     if seconds < 0:
         seconds = 0.0
     total_centiseconds = int(round(seconds * 100))
@@ -46,17 +51,20 @@ def format_lrc_timestamp(seconds: float) -> str:
 
 
 def format_plain_duration(seconds: float) -> str:
+    """Возвращает длительность без квадратных скобок для интерфейса и метаданных."""
     tag = format_lrc_timestamp(seconds)
     return tag[1:-1]
 
 
 def format_filename_duration(seconds: float) -> str:
+    """Форматирует длительность для безопасного включения в имя файла."""
     total_seconds = max(0, int(round(seconds)))
     m, s = divmod(total_seconds, 60)
     return f"{m:02d}m{s:02d}s"
 
 
 def get_audio_duration(audio_path: str) -> float:
+    """Получает полную длительность аудиофайла через ffprobe."""
     completed = subprocess.run(
         [
             'ffprobe',
@@ -73,12 +81,14 @@ def get_audio_duration(audio_path: str) -> float:
 
 
 def _safe_filename_part(value: str) -> str:
+    """Очищает часть имени файла от запрещённых символов и лишних пробелов."""
     value = re.sub(r'[\\/:*?"<>|\x00-\x1f]', ' ', value.strip())
     value = re.sub(r'\s+', ' ', value)
     return value.strip(' .') or 'song'
 
 
 def _song_base_filename(artist: str, title: str, duration: float) -> str:
+    """Формирует базовое имя файлов песни из исполнителя, названия и длительности."""
     artist_part = _safe_filename_part(artist)
     title_part = _safe_filename_part(title)
     duration_part = format_filename_duration(duration)
@@ -86,6 +96,7 @@ def _song_base_filename(artist: str, title: str, duration: float) -> str:
 
 
 def _unique_song_base(base: str) -> str:
+    """Подбирает уникальное базовое имя, не перезаписывая ранее созданные LRC."""
     candidate = base
     index = 2
     while any(os.path.exists(os.path.join(UPLOAD_DIR, f"{candidate} - {lang.upper()}.lrc")) for lang in ('fr', 'ru', 'tr')):
@@ -95,15 +106,18 @@ def _unique_song_base(base: str) -> str:
 
 
 def _song_meta_path(file_id: str) -> str:
+    """Возвращает путь к JSON-файлу метаданных песни."""
     return os.path.join(UPLOAD_DIR, f"{file_id}.json")
 
 
 def _read_song_meta(file_id: str) -> dict:
+    """Читает сохранённые метаданные песни из JSON."""
     with open(_song_meta_path(file_id), 'r', encoding='utf-8') as f:
         return json.load(f)
 
 
 def _song_paths(meta: dict) -> dict:
+    """Преобразует имена языковых файлов из метаданных в полные пути."""
     return {
         lang: os.path.join(UPLOAD_DIR, filename)
         for lang, filename in meta.get('files', {}).items()
@@ -111,6 +125,7 @@ def _song_paths(meta: dict) -> dict:
 
 
 def _read_song_payload(file_id: str) -> dict:
+    """Собирает метаданные и содержимое трёх LRC-файлов для ответа API."""
     meta = _read_song_meta(file_id)
     paths = _song_paths(meta)
     lrc = {}
@@ -127,30 +142,136 @@ def _read_song_payload(file_id: str) -> dict:
 
 
 def _split_lines_preserve(text: str) -> list:
+    """Разбивает текст на строки, сохраняя пустые строки как элементы списка."""
     return text.splitlines()
 
 
 def _nonempty_line_count(lines: list) -> int:
+    """Подсчитывает количество непустых строк текста."""
     return sum(1 for ln in lines if ln.strip())
 
 
+def _spoken_words(seg) -> list:
+    """Возвращает только непустые слова сегмента Whisper."""
+    return [word for word in (getattr(seg, 'words', None) or []) if getattr(word, 'word', '').strip()]
+
+
+def _typical_word_duration(words: list) -> float:
+    """Оценивает типичную длительность слова, исключая аномально длинные значения."""
+    durations = [float(word.end) - float(word.start) for word in words if 0.06 <= float(word.end) - float(word.start) <= 2.0]
+    return statistics.median(durations) if durations else 0.5
+
+
+def _is_boundary_outlier(word, words: list) -> bool:
+    """Определяет, растянула ли модель граничное слово на паузу или проигрыш."""
+    duration = float(word.end) - float(word.start)
+    return len(words) > 1 and duration > max(3.0, _typical_word_duration(words) * 6)
+
+
 def _segment_start(seg) -> float:
-    words = getattr(seg, 'words', None) or []
-    for word in words:
-        if getattr(word, 'word', '').strip():
-            return float(word.start)
-    return float(seg.start)
+    """Возвращает надёжное начало сегмента с коррекцией аномального первого слова."""
+    words = _spoken_words(seg)
+    if not words:
+        return float(seg.start)
+    first = words[0]
+    if _is_boundary_outlier(first, words):
+        return max(float(first.start), float(first.end) - _typical_word_duration(words))
+    return float(first.start)
 
 
 def _segment_end(seg) -> float:
-    words = getattr(seg, 'words', None) or []
-    for word in reversed(words):
-        if getattr(word, 'word', '').strip():
-            return float(word.end)
-    return float(seg.end)
+    """Возвращает надёжный конец сегмента с коррекцией аномального последнего слова."""
+    words = _spoken_words(seg)
+    if not words:
+        return float(seg.end)
+    last = words[-1]
+    if _is_boundary_outlier(last, words):
+        return min(float(last.end), float(last.start) + _typical_word_duration(words))
+    return float(last.end)
 
 
-def _build_line_start_times(lines_fr: list, segments: list) -> list:
+def _normalize_for_match(text: str) -> str:
+    """Нормализует текст для нечувствительного к регистру, акцентам и пунктуации сравнения."""
+    decomposed = unicodedata.normalize('NFKD', text.casefold())
+    return ''.join(char for char in decomposed if char.isalnum())
+
+
+def _word_window_boundaries(words: list) -> tuple:
+    """Вычисляет очищенные временные границы последовательности распознанных слов."""
+    first, last = words[0], words[-1]
+    start = float(first.end) - _typical_word_duration(words) if _is_boundary_outlier(first, words) else float(first.start)
+    end = float(last.start) + _typical_word_duration(words) if _is_boundary_outlier(last, words) else float(last.end)
+    return start, end
+
+
+def _match_transcribed_boundary(segment, transcript_words: list) -> tuple:
+    """Ищет строку forced alignment среди слов проверочной транскрипции."""
+    forced_start, forced_end = _segment_start(segment), _segment_end(segment)
+    target = _normalize_for_match(segment.text)
+    # Короткие повторяющиеся фразы неоднозначны: их оставляем на forced alignment.
+    if len(target) < 10:
+        return forced_start, forced_end
+    best = None
+    max_chars, min_chars = int(len(target) * 1.5) + 8, max(1, int(len(target) * 0.6))
+    # Ищем текст рядом с исходной меткой; окно 35 секунд покрывает длинные проигрыши.
+    for i, word in enumerate(transcript_words):
+        if float(word.end) < forced_start - 35:
+            continue
+        if float(word.start) > forced_start + 35:
+            break
+        candidate_text = ''
+        for j in range(i, len(transcript_words)):
+            candidate_text += _normalize_for_match(transcript_words[j].word)
+            if len(candidate_text) > max_chars:
+                break
+            if len(candidate_text) < min_chars:
+                continue
+            candidate_start, candidate_end = _word_window_boundaries(transcript_words[i:j + 1])
+            distance = abs(candidate_start - forced_start)
+            if distance > 35:
+                continue
+            similarity = SequenceMatcher(None, target, candidate_text).ratio()
+            rank = similarity - distance * 0.001
+            if best is None or rank > best[0]:
+                best = (rank, similarity, candidate_start, candidate_end)
+    # Порог 0.80 не позволяет исправлять время по слабому текстовому совпадению.
+    if best is None or best[1] < 0.80:
+        return forced_start, forced_end
+    return best[2], best[3]
+
+
+def _refine_segment_boundaries(segments: list, transcription) -> tuple:
+    """Уточняет границы сегментов по уверенным совпадениям проверочной транскрипции."""
+    transcript_words = [word for segment in transcription.segments for word in (getattr(segment, 'words', None) or []) if getattr(word, 'word', '').strip()]
+    starts, ends = [], []
+    for segment in segments:
+        forced_start, forced_end = _segment_start(segment), _segment_end(segment)
+        matched_start, matched_end = _match_transcribed_boundary(segment, transcript_words)
+        # Заменяем обе границы только при существенном расхождении более трёх секунд.
+        if max(abs(matched_start - forced_start), abs(matched_end - forced_end)) > 3:
+            starts.append(matched_start); ends.append(matched_end)
+        else:
+            starts.append(forced_start); ends.append(forced_end)
+    # После уточнения гарантируем неубывающие начала и корректные интервалы сегментов.
+    for i in range(1, len(starts)):
+        starts[i] = max(starts[i], starts[i - 1])
+        ends[i] = max(ends[i], starts[i])
+    for i in range(len(ends) - 1):
+        ends[i] = min(ends[i], starts[i + 1])
+    return starts, ends
+
+
+def _needs_transcription_refinement(segments: list) -> bool:
+    """Проверяет, есть ли разрыв более 10 секунд, требующий второго прохода."""
+    return any(_segment_start(current) - _segment_end(previous) > 10 for previous, current in zip(segments, segments[1:]))
+
+
+def _build_line_start_times(
+    lines_fr: list,
+    segments: list,
+    segment_starts: list = None,
+    segment_ends: list = None,
+) -> list:
     """
     Одна временная метка на строку FR.
     Пустые строки в Whisper не дают отдельных сегментов: сегментов столько же,
@@ -161,8 +282,13 @@ def _build_line_start_times(lines_fr: list, segments: list) -> list:
     if ns == 0:
         raise ValueError('Модель не вернула сегментов — проверьте аудио и текст FR')
 
+    if segment_starts is None:
+        segment_starts = [_segment_start(seg) for seg in segments]
+    if segment_ends is None:
+        segment_ends = [_segment_end(seg) for seg in segments]
+
     if ns == n:
-        return [_segment_start(seg) for seg in segments]
+        return segment_starts
 
     n_ne = _nonempty_line_count(lines_fr)
     if ns != n_ne:
@@ -177,17 +303,18 @@ def _build_line_start_times(lines_fr: list, segments: list) -> list:
     for i in range(n):
         if not lines_fr[i].strip():
             if j > 0:
-                times[i] = _segment_end(segments[j - 1])
+                times[i] = segment_ends[j - 1]
             else:
-                times[i] = max(0.0, float(segments[0].start))
+                times[i] = max(0.0, segment_starts[0])
         else:
-            times[i] = _segment_start(segments[j])
+            times[i] = segment_starts[j]
             j += 1
 
     return times
 
 
 def _lrc_line(tag: str, line: str) -> str:
+    """Объединяет временную метку и текст, не добавляя текст к пустой строке."""
     line = line if line is not None else ''
     if line.strip() == '':
         return tag
@@ -195,6 +322,7 @@ def _lrc_line(tag: str, line: str) -> str:
 
 
 def _song_label(artist: str, title: str) -> str:
+    """Формирует отображаемую подпись песни из исполнителя и названия."""
     artist = artist.strip()
     title = title.strip()
     if artist and title:
@@ -210,6 +338,7 @@ def _build_lrc(
     lyric_end: float,
     duration: float,
 ) -> str:
+    """Собирает полный LRC-текст с заголовком, строками песни и конечными метками."""
     title_pause = first_lyric_start / 2
     out = [
         _lrc_line(format_lrc_timestamp(0.0), song_label),
@@ -247,9 +376,16 @@ def align_multilang_lrc(
     m = get_model()
     result = m.align(audio_path, lyrics_fr, language=language, original_split=True)
     segments = list(result.segments)
-    starts = _build_line_start_times(lines_fr, segments)
+    segment_starts = [_segment_start(seg) for seg in segments]
+    segment_ends = [_segment_end(seg) for seg in segments]
+    # Второй проход запускается только при подозрительном разрыве, чтобы не замедлять обычные песни.
+    if _needs_transcription_refinement(segments):
+        print('Suspicious alignment gap detected; verifying timestamps with transcription...')
+        transcription = m.transcribe(audio_path, language=language, regroup=False)
+        segment_starts, segment_ends = _refine_segment_boundaries(segments, transcription)
+    starts = _build_line_start_times(lines_fr, segments, segment_starts, segment_ends)
     first_lyric_start = next(starts[i] for i, line in enumerate(lines_fr) if line.strip())
-    lyric_end = max(_segment_end(seg) for seg in segments)
+    lyric_end = max(segment_ends)
     duration = max(get_audio_duration(audio_path), lyric_end)
     label = _song_label(artist, title)
 
@@ -264,11 +400,13 @@ def align_multilang_lrc(
 
 @app.route('/')
 def index():
+    """Отображает главную страницу веб-интерфейса."""
     return render_template('index.html')
 
 
 @app.route('/align', methods=['POST'])
 def align():
+    """Принимает аудио и три текста, выполняет выравнивание и сохраняет LRC-файлы."""
     if 'audio' not in request.files:
         return jsonify({'error': 'MP3 файл не загружен'}), 400
 
@@ -356,6 +494,7 @@ def align():
 
 @app.route('/download/<file_id>/<lang>')
 def download(file_id, lang):
+    """Возвращает выбранный языковой LRC-файл для скачивания."""
     if lang not in ('fr', 'ru', 'tr'):
         return jsonify({'error': 'Неверный язык'}), 400
 
@@ -381,6 +520,7 @@ def download(file_id, lang):
 
 @app.route('/songs')
 def songs():
+    """Возвращает список ранее обработанных песен и их метаданные."""
     items = []
     for name in os.listdir(UPLOAD_DIR):
         if not name.endswith('.json'):
@@ -406,6 +546,7 @@ def songs():
 
 @app.route('/songs/<file_id>')
 def song(file_id):
+    """Возвращает метаданные и тексты одной сохранённой песни по её идентификатору."""
     if not re.fullmatch(r'[0-9a-fA-F-]{36}', file_id):
         return jsonify({'error': 'Неверный ID песни'}), 400
     if not os.path.exists(_song_meta_path(file_id)):
