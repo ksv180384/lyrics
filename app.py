@@ -165,7 +165,10 @@ def _typical_word_duration(words: list) -> float:
 def _is_boundary_outlier(word, words: list) -> bool:
     """Определяет, растянула ли модель граничное слово на паузу или проигрыш."""
     duration = float(word.end) - float(word.start)
-    return len(words) > 1 and duration > max(3.0, _typical_word_duration(words) * 6)
+    # stable-ts иногда растягивает единственное слово последней строки до конца
+    # файла. Такое слово тоже нужно считать выбросом: соседних слов для сравнения
+    # внутри сегмента в этом случае нет.
+    return duration > max(3.0, _typical_word_duration(words) * 6)
 
 
 def _segment_start(seg) -> float:
@@ -204,21 +207,14 @@ def _word_window_boundaries(words: list) -> tuple:
     return start, end
 
 
-def _match_transcribed_boundary(segment, transcript_words: list) -> tuple:
-    """Ищет строку forced alignment среди слов проверочной транскрипции."""
-    forced_start, forced_end = _segment_start(segment), _segment_end(segment)
+def _transcription_candidates(segment, transcript_words: list) -> list:
+    """Возвращает уверенные варианты строки во всей проверочной транскрипции."""
     target = _normalize_for_match(segment.text)
-    # Короткие повторяющиеся фразы неоднозначны: их оставляем на forced alignment.
     if len(target) < 10:
-        return forced_start, forced_end
-    best = None
+        return []
+    candidates = []
     max_chars, min_chars = int(len(target) * 1.5) + 8, max(1, int(len(target) * 0.6))
-    # Ищем текст рядом с исходной меткой; окно 35 секунд покрывает длинные проигрыши.
     for i, word in enumerate(transcript_words):
-        if float(word.end) < forced_start - 35:
-            continue
-        if float(word.start) > forced_start + 35:
-            break
         candidate_text = ''
         for j in range(i, len(transcript_words)):
             candidate_text += _normalize_for_match(transcript_words[j].word)
@@ -227,26 +223,62 @@ def _match_transcribed_boundary(segment, transcript_words: list) -> tuple:
             if len(candidate_text) < min_chars:
                 continue
             candidate_start, candidate_end = _word_window_boundaries(transcript_words[i:j + 1])
-            distance = abs(candidate_start - forced_start)
-            if distance > 35:
-                continue
             similarity = SequenceMatcher(None, target, candidate_text).ratio()
-            rank = similarity - distance * 0.001
-            if best is None or rank > best[0]:
-                best = (rank, similarity, candidate_start, candidate_end)
-    # Порог 0.80 не позволяет исправлять время по слабому текстовому совпадению.
-    if best is None or best[1] < 0.80:
-        return forced_start, forced_end
-    return best[2], best[3]
+            if similarity >= 0.80:
+                candidates.append((i, j + 1, similarity, candidate_start, candidate_end))
+
+    # Оставляем лучшие варианты, но не отбрасываем повторы припева: далее их
+    # разрулит глобальный поиск с обязательным сохранением порядка строк.
+    return sorted(candidates, key=lambda item: item[2], reverse=True)[:24]
+
+
+def _ordered_transcription_matches(segments: list, transcript_words: list) -> dict:
+    """Находит максимальную цепочку непересекающихся строк в порядке песни."""
+    nodes = []
+    for line_index, segment in enumerate(segments):
+        for candidate in _transcription_candidates(segment, transcript_words):
+            nodes.append((line_index, *candidate))
+
+    # Взвешенная возрастающая подпоследовательность. Она не даст первой строке
+    # повторяющегося припева привязаться к его позднему повтору ценой пропуска
+    # нескольких следующих строк.
+    scores = [node[3] for node in nodes]
+    previous = [-1] * len(nodes)
+    for current, node in enumerate(nodes):
+        line_index, word_start = node[0], node[1]
+        for prior in range(current):
+            prior_node = nodes[prior]
+            if prior_node[0] >= line_index or prior_node[2] > word_start:
+                continue
+            score = scores[prior] + node[3]
+            if score > scores[current]:
+                scores[current] = score
+                previous[current] = prior
+
+    if not nodes:
+        return {}
+    cursor = max(range(len(nodes)), key=scores.__getitem__)
+    matches = {}
+    while cursor >= 0:
+        line_index, _, _, similarity, start, end = nodes[cursor]
+        matches[line_index] = (similarity, start, end)
+        cursor = previous[cursor]
+    return matches
 
 
 def _refine_segment_boundaries(segments: list, transcription) -> tuple:
     """Уточняет границы сегментов по уверенным совпадениям проверочной транскрипции."""
     transcript_words = [word for segment in transcription.segments for word in (getattr(segment, 'words', None) or []) if getattr(word, 'word', '').strip()]
+    matches = _ordered_transcription_matches(segments, transcript_words)
     starts, ends = [], []
-    for segment in segments:
+    transcript_start = min((float(word.start) for word in transcript_words), default=0.0)
+    for i, segment in enumerate(segments):
         forced_start, forced_end = _segment_start(segment), _segment_end(segment)
-        matched_start, matched_end = _match_transcribed_boundary(segment, transcript_words)
+        _, matched_start, matched_end = matches.get(i, (0.0, forced_start, forced_end))
+        # Транскрипция песен нередко пропускает вступление. Не переносим на её
+        # первое найденное слово строки, которые forced alignment уже поставил раньше.
+        if forced_start < transcript_start <= matched_start:
+            matched_start, matched_end = forced_start, forced_end
         # Заменяем обе границы только при существенном расхождении более трёх секунд.
         if max(abs(matched_start - forced_start), abs(matched_end - forced_end)) > 3:
             starts.append(matched_start); ends.append(matched_end)
@@ -261,9 +293,25 @@ def _refine_segment_boundaries(segments: list, transcription) -> tuple:
     return starts, ends
 
 
-def _needs_transcription_refinement(segments: list) -> bool:
-    """Проверяет, есть ли разрыв более 10 секунд, требующий второго прохода."""
-    return any(_segment_start(current) - _segment_end(previous) > 10 for previous, current in zip(segments, segments[1:]))
+def _needs_transcription_refinement(segments: list, duration: float) -> bool:
+    """Ищет разрывы, сжатие текста и растянутые до конца файла слова."""
+    if any(_segment_start(current) - _segment_end(previous) > 10 for previous, current in zip(segments, segments[1:])):
+        return True
+    if any(
+        float(word.end) - float(word.start) > 10
+        for segment in segments
+        for word in _spoken_words(segment)
+    ):
+        return True
+    starts = [_segment_start(segment) for segment in segments]
+    if any(current - previous < 0.25 for previous, current in zip(starts, starts[1:])):
+        return True
+    # Неуспешный последний сегмент stable-ts бывает пустым и получает end,
+    # равный длительности файла. В этом случае смотрим на начало последней строки.
+    if starts and duration - starts[-1] > max(30.0, duration * 0.20):
+        return True
+    reliable_end = max((_segment_end(segment) for segment in segments), default=0.0)
+    return duration - reliable_end > max(20.0, duration * 0.15)
 
 
 def _build_line_start_times(
@@ -378,15 +426,16 @@ def align_multilang_lrc(
     segments = list(result.segments)
     segment_starts = [_segment_start(seg) for seg in segments]
     segment_ends = [_segment_end(seg) for seg in segments]
+    duration = get_audio_duration(audio_path)
     # Второй проход запускается только при подозрительном разрыве, чтобы не замедлять обычные песни.
-    if _needs_transcription_refinement(segments):
+    if _needs_transcription_refinement(segments, duration):
         print('Suspicious alignment gap detected; verifying timestamps with transcription...')
         transcription = m.transcribe(audio_path, language=language, regroup=False)
         segment_starts, segment_ends = _refine_segment_boundaries(segments, transcription)
     starts = _build_line_start_times(lines_fr, segments, segment_starts, segment_ends)
     first_lyric_start = next(starts[i] for i, line in enumerate(lines_fr) if line.strip())
     lyric_end = max(segment_ends)
-    duration = max(get_audio_duration(audio_path), lyric_end)
+    duration = max(duration, lyric_end)
     label = _song_label(artist, title)
 
     return (
