@@ -253,10 +253,21 @@ def _ordered_transcription_matches(segments: list, transcript_words: list) -> di
         for candidate in _transcription_candidates(segment, transcript_words):
             nodes.append((line_index, *candidate))
 
-    # Взвешенная возрастающая подпоследовательность. Она не даст первой строке
-    # повторяющегося припева привязаться к его позднему повтору ценой пропуска
-    # нескольких следующих строк.
-    scores = [node[3] for node in nodes]
+    # Уникальные строки служат более сильными опорами, чем короткие повторы
+    # припева: иначе длинная цепочка из одних «почему» может перескочить через
+    # точно распознанный мост песни.
+    normalized_lines = [_normalize_for_match(segment.text) for segment in segments]
+    occurrence_counts = {
+        text: normalized_lines.count(text)
+        for text in set(normalized_lines)
+    }
+    line_weights = [
+        1.0
+        + (1.5 if occurrence_counts[text] == 1 else 0.0)
+        + min(0.75, len(text) / 40)
+        for text in normalized_lines
+    ]
+    scores = [node[3] * line_weights[node[0]] for node in nodes]
     previous = [-1] * len(nodes)
     for current, node in enumerate(nodes):
         line_index, word_start = node[0], node[1]
@@ -264,7 +275,7 @@ def _ordered_transcription_matches(segments: list, transcript_words: list) -> di
             prior_node = nodes[prior]
             if prior_node[0] >= line_index or prior_node[2] > word_start:
                 continue
-            score = scores[prior] + node[3]
+            score = scores[prior] + node[3] * line_weights[line_index]
             if score > scores[current]:
                 scores[current] = score
                 previous[current] = prior
@@ -390,6 +401,78 @@ def _repair_untrusted_ranges(
     return starts, ends
 
 
+def _repair_repeated_text_blocks(
+    segments: list,
+    starts: list,
+    ends: list,
+) -> tuple:
+    """Копирует проверенный ритм на поздний дословно повторяющийся блок."""
+    normalized = [_normalize_for_match(segment.text) for segment in segments]
+    forced_starts = [_segment_start(segment) for segment in segments]
+    destination = 1
+
+    while destination < len(segments):
+        best = None
+        for source in range(destination):
+            length = 0
+            while (
+                destination + length < len(segments)
+                and source + length < destination
+                and normalized[source + length] == normalized[destination + length]
+            ):
+                length += 1
+            if length < 3:
+                continue
+
+            source_deltas = [
+                forced_starts[i + 1] - forced_starts[i]
+                for i in range(source, source + length - 1)
+            ]
+            if any(delta < 0.5 or delta > 12 for delta in source_deltas):
+                continue
+            candidate = (length, source)
+            if best is None or candidate > best:
+                best = candidate
+
+        if best is None:
+            destination += 1
+            continue
+
+        length, source = best
+        source_deltas = [
+            starts[source + i + 1] - starts[source + i]
+            for i in range(length - 1)
+        ]
+        destination_deltas = [
+            forced_starts[destination + i + 1] - forced_starts[destination + i]
+            for i in range(length - 1)
+        ]
+        timing_is_broken = any(
+            destination_delta < 0.5
+            or destination_delta > 12
+            or abs(destination_delta - source_delta) > max(1.0, source_delta * 0.6)
+            for source_delta, destination_delta in zip(source_deltas, destination_deltas)
+        )
+        if not timing_is_broken:
+            destination += 1
+            continue
+
+        source_start = starts[source]
+        destination_start = forced_starts[destination]
+        for offset in range(length):
+            starts[destination + offset] = (
+                destination_start + starts[source + offset] - source_start
+            )
+            ends[destination + offset] = (
+                destination_start + ends[source + offset] - source_start
+            )
+        destination += length
+
+    for i in range(len(ends) - 1):
+        ends[i] = min(max(ends[i], starts[i]), starts[i + 1])
+    return starts, ends
+
+
 def _refine_segment_boundaries(segments: list, transcription, duration: float) -> tuple:
     """Уточняет границы сегментов по уверенным совпадениям проверочной транскрипции."""
     transcript_words = [word for segment in transcription.segments for word in (getattr(segment, 'words', None) or []) if getattr(word, 'word', '').strip()]
@@ -424,7 +507,13 @@ def _refine_segment_boundaries(segments: list, transcription, duration: float) -
         ends[i] = max(ends[i], starts[i])
     for i in range(len(ends) - 1):
         ends[i] = min(ends[i], starts[i + 1])
-    return _repair_repeated_segment_starts(segments, starts, ends, duration)
+    starts, ends = _repair_repeated_segment_starts(
+        segments,
+        starts,
+        ends,
+        duration,
+    )
+    return _repair_repeated_text_blocks(segments, starts, ends)
 
 
 def _needs_transcription_refinement(segments: list, duration: float) -> bool:
