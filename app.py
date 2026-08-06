@@ -200,7 +200,10 @@ def _segment_end(seg) -> float:
 
 def _normalize_for_match(text: str) -> str:
     """Нормализует текст для нечувствительного к регистру, акцентам и пунктуации сравнения."""
-    decomposed = unicodedata.normalize('NFKD', text.casefold())
+    # Бэки и адлибы в скобках часто отсутствуют в транскрипции Whisper. Они
+    # остаются в LRC, но не должны мешать найти основную строку в аудио.
+    text_without_adlibs = re.sub(r'\([^)]*\)', '', text)
+    decomposed = unicodedata.normalize('NFKD', text_without_adlibs.casefold())
     return ''.join(char for char in decomposed if char.isalnum())
 
 
@@ -339,11 +342,59 @@ def _repair_repeated_segment_starts(
     return starts, ends
 
 
+def _repair_untrusted_ranges(
+    starts: list,
+    ends: list,
+    trusted: set,
+    transcript_words: list,
+    duration: float,
+) -> tuple:
+    """Не позволяет ошибочной старой метке сдвинуть последующие надёжные совпадения."""
+    anchors = sorted(trusted)
+    for left, right in zip(anchors, anchors[1:]):
+        if right - left <= 1:
+            continue
+        block_is_invalid = any(
+            starts[i] <= starts[i - 1] or starts[i] >= starts[right]
+            for i in range(left + 1, right)
+        )
+        if block_is_invalid:
+            step = (starts[right] - starts[left]) / (right - left)
+            for i in range(left + 1, right):
+                starts[i] = starts[left] + step * (i - left)
+                ends[i] = starts[i + 1] if i + 1 < right else starts[right]
+
+    if anchors and anchors[-1] < len(starts) - 1:
+        last_anchor = anchors[-1]
+        tail_is_invalid = (
+            starts[last_anchor + 1] <= starts[last_anchor]
+            or starts[last_anchor + 1] - ends[last_anchor] > 10
+            or starts[-1] >= duration - 0.25
+        )
+        if tail_is_invalid:
+            transcript_end = max(
+                (float(word.end) for word in transcript_words),
+                default=ends[last_anchor],
+            )
+            tail_count = len(starts) - last_anchor - 1
+            tail_start = min(max(ends[last_anchor], starts[last_anchor]), transcript_end)
+            step = max(0.0, transcript_end - tail_start) / (tail_count + 1)
+            for offset, i in enumerate(range(last_anchor + 1, len(starts)), start=1):
+                starts[i] = tail_start + step * offset
+                ends[i] = (
+                    starts[i + 1]
+                    if i + 1 < len(starts)
+                    else max(starts[i], transcript_end)
+                )
+
+    return starts, ends
+
+
 def _refine_segment_boundaries(segments: list, transcription, duration: float) -> tuple:
     """Уточняет границы сегментов по уверенным совпадениям проверочной транскрипции."""
     transcript_words = [word for segment in transcription.segments for word in (getattr(segment, 'words', None) or []) if getattr(word, 'word', '').strip()]
     matches = _ordered_transcription_matches(segments, transcript_words)
-    starts, ends = [], []
+    starts, ends, trusted = [], [], set()
     transcript_start = min((float(word.start) for word in transcript_words), default=0.0)
     for i, segment in enumerate(segments):
         forced_start, forced_end = _segment_start(segment), _segment_end(segment)
@@ -352,12 +403,21 @@ def _refine_segment_boundaries(segments: list, transcription, duration: float) -
         # первое найденное слово строки, которые forced alignment уже поставил раньше.
         if forced_start < transcript_start <= matched_start:
             matched_start, matched_end = forced_start, forced_end
+        elif i in matches:
+            trusted.add(i)
         # Уверенное глобальное совпадение точнее forced alignment уже при
         # расхождении от полутора секунд.
         if max(abs(matched_start - forced_start), abs(matched_end - forced_end)) > 1.5:
             starts.append(matched_start); ends.append(matched_end)
         else:
             starts.append(forced_start); ends.append(forced_end)
+    starts, ends = _repair_untrusted_ranges(
+        starts,
+        ends,
+        trusted,
+        transcript_words,
+        duration,
+    )
     # После уточнения гарантируем неубывающие начала и корректные интервалы сегментов.
     for i in range(1, len(starts)):
         starts[i] = max(starts[i], starts[i - 1])
