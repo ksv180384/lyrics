@@ -291,6 +291,40 @@ def _ordered_transcription_matches(segments: list, transcript_words: list) -> di
     return matches
 
 
+def _recover_matches_before_large_gaps(
+    segments: list,
+    matches: dict,
+    transcript_words: list,
+) -> dict:
+    """Recover lines that forced alignment left before a false large gap."""
+    forced_starts = [_segment_start(segment) for segment in segments]
+    for right in range(1, len(segments)):
+        if forced_starts[right] - forced_starts[right - 1] <= 10:
+            continue
+
+        cursor = forced_starts[right]
+        for i in range(right - 1, max(-1, right - 9), -1):
+            viable = [
+                candidate
+                for candidate in _transcription_candidates(segments[i], transcript_words)
+                if candidate[2] >= 0.86
+                and candidate[3] >= forced_starts[i] - 3
+                and candidate[4] <= cursor + 0.8
+            ]
+            if not viable:
+                break
+
+            _, _, similarity, start, end = max(
+                viable,
+                key=lambda candidate: (candidate[2], candidate[3]),
+            )
+            if abs(start - forced_starts[i]) <= 3:
+                break
+            matches[i] = (similarity, start, end)
+            cursor = start
+
+    return matches
+
 def _same_repeated_phrase(left: str, right: str) -> bool:
     """Считает соседние полную и сокращённую формы припева одним повтором."""
     left_norm = _normalize_for_match(left)
@@ -477,6 +511,11 @@ def _refine_segment_boundaries(segments: list, transcription, duration: float) -
     """Уточняет границы сегментов по уверенным совпадениям проверочной транскрипции."""
     transcript_words = [word for segment in transcription.segments for word in (getattr(segment, 'words', None) or []) if getattr(word, 'word', '').strip()]
     matches = _ordered_transcription_matches(segments, transcript_words)
+    matches = _recover_matches_before_large_gaps(
+        segments,
+        matches,
+        transcript_words,
+    )
     starts, ends, trusted = [], [], set()
     transcript_start = min((float(word.start) for word in transcript_words), default=0.0)
     for i, segment in enumerate(segments):
