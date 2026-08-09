@@ -559,13 +559,18 @@ def _needs_transcription_refinement(segments: list, duration: float) -> bool:
     """Ищет разрывы, сжатие текста и растянутые до конца файла слова."""
     if any(_segment_start(current) - _segment_end(previous) > 10 for previous, current in zip(segments, segments[1:])):
         return True
+    # Forced alignment может растянуть конец предыдущей строки до начала
+    # следующей. Тогда разрыв между сегментами не виден, но их начала уже
+    # расходятся на десятки секунд.
+    starts = [_segment_start(segment) for segment in segments]
+    if any(current - previous > 10 for previous, current in zip(starts, starts[1:])):
+        return True
     if any(
         float(word.end) - float(word.start) > 10
         for segment in segments
         for word in _spoken_words(segment)
     ):
         return True
-    starts = [_segment_start(segment) for segment in segments]
     if any(current - previous < 0.25 for previous, current in zip(starts, starts[1:])):
         return True
     # Неуспешный последний сегмент stable-ts бывает пустым и получает end,
