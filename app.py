@@ -250,7 +250,18 @@ def _ordered_transcription_matches(segments: list, transcript_words: list) -> di
     """Находит максимальную цепочку непересекающихся строк в порядке песни."""
     nodes = []
     for line_index, segment in enumerate(segments):
+        forced_start = _segment_start(segment)
+        segment_is_stretched = float(segment.end) - float(segment.start) > 10
         for candidate in _transcription_candidates(segment, transcript_words):
+            # Repeated chorus lines can match several real occurrences. A far
+            # match is useful only when forced alignment itself stretched this
+            # segment across an instrumental passage.
+            if not segment_is_stretched and abs(candidate[3] - forced_start) > 8:
+                continue
+            if segment_is_stretched and not (
+                forced_start - 3 <= candidate[3] <= float(segment.end) + 3
+            ):
+                continue
             nodes.append((line_index, *candidate))
 
     # Уникальные строки служат более сильными опорами, чем короткие повторы
@@ -413,7 +424,7 @@ def _repair_untrusted_ranges(
         last_anchor = anchors[-1]
         tail_is_invalid = (
             starts[last_anchor + 1] <= starts[last_anchor]
-            or starts[last_anchor + 1] - ends[last_anchor] > 10
+            or starts[last_anchor + 1] - ends[last_anchor] > max(20.0, duration * 0.12)
             or starts[-1] >= duration - 0.25
         )
         if tail_is_invalid:
@@ -478,13 +489,12 @@ def _repair_repeated_text_blocks(
             for i in range(length - 1)
         ]
         destination_deltas = [
-            forced_starts[destination + i + 1] - forced_starts[destination + i]
+            starts[destination + i + 1] - starts[destination + i]
             for i in range(length - 1)
         ]
         timing_is_broken = any(
-            destination_delta < 0.5
-            or destination_delta > 12
-            or abs(destination_delta - source_delta) > max(1.0, source_delta * 0.6)
+            destination_delta > 12
+            or (destination_delta < 0.5 and source_delta >= 0.75)
             for source_delta, destination_delta in zip(source_deltas, destination_deltas)
         )
         if not timing_is_broken:
@@ -492,10 +502,36 @@ def _repair_repeated_text_blocks(
             continue
 
         source_start = starts[source]
-        destination_start = forced_starts[destination]
+        source_offsets = [starts[source + i] - source_start for i in range(length)]
+        # A broken repeat can split into two plausible timing clusters: the
+        # beginning may align to an early instrumental while the final lines
+        # align to the real vocals. Infer a shared shift from the entire block.
+        shift_candidates = [
+            forced_starts[destination + i] - starts[source + i]
+            for i in range(length)
+        ]
+        shift_tolerance = 1.0
+        ranked_shifts = []
+        source_gap_before = source_start - ends[source - 1] if source > 0 else None
+        for candidate_shift in shift_candidates:
+            inliers = [
+                shift
+                for shift in shift_candidates
+                if abs(shift - candidate_shift) <= shift_tolerance
+            ]
+            shift = statistics.median(inliers)
+            destination_start = source_start + shift
+            context_error = 0.0
+            if destination > 0 and source_gap_before is not None:
+                destination_gap_before = destination_start - ends[destination - 1]
+                context_error = abs(destination_gap_before - source_gap_before)
+            ranked_shifts.append((len(inliers), -context_error, shift))
+
+        _, _, block_shift = max(ranked_shifts)
+        destination_start = source_start + block_shift
         for offset in range(length):
             starts[destination + offset] = (
-                destination_start + starts[source + offset] - source_start
+                destination_start + source_offsets[offset]
             )
             ends[destination + offset] = (
                 destination_start + ends[source + offset] - source_start
