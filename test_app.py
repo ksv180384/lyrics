@@ -3,8 +3,11 @@ from types import SimpleNamespace
 
 from app import (
     _ordered_transcription_matches,
+    _repair_collapsed_segments_before_late_groups,
     _repair_repeated_text_blocks,
     _repair_untrusted_ranges,
+    _segment_end,
+    _segment_start,
 )
 
 
@@ -66,6 +69,81 @@ class RepeatedBlockRepairTests(unittest.TestCase):
         )
 
         self.assertEqual(repaired_starts[8:14], refined_starts)
+
+    def test_recovers_late_phrase_after_collapsed_false_words(self):
+        def word(text, start, end):
+            return SimpleNamespace(word=text, start=start, end=end)
+
+        segments = [
+            SimpleNamespace(
+                text="Les annees passent",
+                start=114.94,
+                end=116.86,
+                words=[
+                    word(" Les", 114.94, 115.16),
+                    word(" annees", 115.16, 115.16),
+                    word(" passent", 115.16, 116.86),
+                ],
+            ),
+            SimpleNamespace(
+                text="Les amis restent",
+                start=117.0,
+                end=117.08,
+                words=[
+                    word(" Les", 117.0, 117.08),
+                    word(" amis", 117.08, 117.08),
+                    word(" restent", 117.08, 117.08),
+                ],
+            ),
+            SimpleNamespace(
+                text="La vie defile",
+                start=117.08,
+                end=128.2,
+                words=[
+                    word(" La", 117.08, 117.12),
+                    word(" vie", 117.12, 117.24),
+                    word(" defile", 125.56, 128.2),
+                ],
+            ),
+        ]
+        starts = [_segment_start(segment) for segment in segments]
+        ends = [_segment_end(segment) for segment in segments]
+
+        repaired_starts, repaired_ends = (
+            _repair_collapsed_segments_before_late_groups(
+                segments, starts, ends, set()
+            )
+        )
+
+        self.assertEqual(
+            [round(value, 2) for value in repaired_starts],
+            [120.79, 122.96, 124.56],
+        )
+        self.assertEqual(
+            [round(value, 2) for value in repaired_ends],
+            [122.71, 124.31, 126.06],
+        )
+
+    def test_ignores_match_shifted_almost_eight_seconds(self):
+        segments = [
+            SimpleNamespace(
+                text="On a tellement de souvenirs",
+                start=138.66,
+                end=140.70,
+                words=[],
+            )
+        ]
+        transcript_words = [
+            SimpleNamespace(word="On", start=131.0, end=131.2),
+            SimpleNamespace(word=" a", start=131.2, end=131.4),
+            SimpleNamespace(word=" tellement", start=131.4, end=132.0),
+            SimpleNamespace(word=" de", start=132.0, end=132.2),
+            SimpleNamespace(word=" souvenirs", start=132.2, end=133.0),
+        ]
+
+        matches = _ordered_transcription_matches(segments, transcript_words)
+
+        self.assertEqual(matches, {})
 
     def test_preserves_coherent_tail_after_instrumental_break(self):
         starts = [116.40, 118.22, 119.90, 121.78, 123.94, 125.76, 127.58, 129.26, 142.20, 144.70]

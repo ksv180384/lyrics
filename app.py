@@ -173,11 +173,30 @@ def _is_boundary_outlier(word, words: list) -> bool:
     return duration > max(3.0, _typical_word_duration(words) * 6)
 
 
+def _late_word_group_index(words: list):
+    """Find a late word group after collapsed false words at a segment boundary."""
+    for index in range(1, len(words)):
+        gap = float(words[index].start) - float(words[index - 1].end)
+        prefix_duration = sum(
+            max(0.0, float(word.end) - float(word.start))
+            for word in words[:index]
+        )
+        if gap > 3.0 and prefix_duration < 0.5:
+            return index
+    return None
+
+
 def _segment_start(seg) -> float:
     """Возвращает надёжное начало сегмента с коррекцией аномального первого слова."""
     words = _spoken_words(seg)
     if not words:
         return float(seg.start)
+    late_group_index = _late_word_group_index(words)
+    if late_group_index is not None:
+        return max(
+            float(words[0].start),
+            float(words[late_group_index].start) - 0.5 * late_group_index,
+        )
     first = words[0]
     if _is_boundary_outlier(first, words):
         typical_duration = 0.5 if len(words) == 1 else _typical_word_duration(words)
@@ -190,12 +209,50 @@ def _segment_end(seg) -> float:
     words = _spoken_words(seg)
     if not words:
         return float(seg.end)
+    if _late_word_group_index(words) is not None:
+        last = words[-1]
+        return min(float(last.end), float(last.start) + 0.5)
     last = words[-1]
     if _is_boundary_outlier(last, words):
         if len(words) == 1:
             return float(last.end)
         return min(float(last.end), float(last.start) + _typical_word_duration(words))
     return float(last.end)
+
+
+def _repair_collapsed_segments_before_late_groups(
+    segments: list,
+    starts: list,
+    ends: list,
+    trusted: set,
+) -> tuple:
+    """Backfill collapsed lines immediately before a reliable late word group."""
+    for anchor, segment in enumerate(segments):
+        words = _spoken_words(segment)
+        if _late_word_group_index(words) is None:
+            continue
+
+        cursor = starts[anchor]
+        for index in range(anchor - 1, max(-1, anchor - 4), -1):
+            previous_words = _spoken_words(segments[index])
+            if index in trusted or not previous_words:
+                break
+            has_collapsed_word = any(
+                float(word.end) - float(word.start) < 0.06
+                for word in previous_words
+            )
+            if not has_collapsed_word:
+                break
+
+            raw_span = float(segments[index].end) - float(segments[index].start)
+            estimated_duration = max(1.2, len(previous_words) * 0.45)
+            if 0.5 <= raw_span <= 3.0:
+                estimated_duration = max(estimated_duration, raw_span)
+            cursor -= estimated_duration + 0.25
+            starts[index] = cursor
+            ends[index] = min(starts[index + 1], cursor + estimated_duration)
+
+    return starts, ends
 
 
 def _normalize_for_match(text: str) -> str:
@@ -256,7 +313,7 @@ def _ordered_transcription_matches(segments: list, transcript_words: list) -> di
             # Repeated chorus lines can match several real occurrences. A far
             # match is useful only when forced alignment itself stretched this
             # segment across an instrumental passage.
-            if not segment_is_stretched and abs(candidate[3] - forced_start) > 8:
+            if not segment_is_stretched and abs(candidate[3] - forced_start) > 5:
                 continue
             if segment_is_stretched and not (
                 forced_start - 3 <= candidate[3] <= float(segment.end) + 3
@@ -569,6 +626,12 @@ def _refine_segment_boundaries(segments: list, transcription, duration: float) -
             starts.append(matched_start); ends.append(matched_end)
         else:
             starts.append(forced_start); ends.append(forced_end)
+    starts, ends = _repair_collapsed_segments_before_late_groups(
+        segments,
+        starts,
+        ends,
+        trusted,
+    )
     starts, ends = _repair_untrusted_ranges(
         starts,
         ends,
