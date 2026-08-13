@@ -2,6 +2,8 @@ import unittest
 from types import SimpleNamespace
 
 from app import (
+    _collapsed_prefix_retry_offset,
+    _has_severely_collapsed_prefix,
     _ordered_transcription_matches,
     _repair_collapsed_segments_before_late_groups,
     _repair_repeated_text_blocks,
@@ -144,6 +146,88 @@ class RepeatedBlockRepairTests(unittest.TestCase):
         matches = _ordered_transcription_matches(segments, transcript_words)
 
         self.assertEqual(matches, {})
+
+    def test_detects_severely_collapsed_opening_lines(self):
+        segments = [
+            SimpleNamespace(text=f"line {index}", start=index, end=index, words=[])
+            for index in range(10)
+        ]
+
+        self.assertTrue(_has_severely_collapsed_prefix(segments))
+
+    def test_caps_intro_retry_at_twenty_seconds(self):
+        segments = [
+            SimpleNamespace(
+                text="unique opening phrase",
+                start=0.0,
+                end=0.0,
+                words=[],
+            )
+        ]
+        transcription = SimpleNamespace(
+            segments=[
+                SimpleNamespace(
+                    words=[
+                        SimpleNamespace(
+                            word="unique", start=41.0, end=41.8
+                        ),
+                        SimpleNamespace(
+                            word=" opening", start=41.9, end=42.8
+                        ),
+                        SimpleNamespace(
+                            word=" phrase", start=42.9, end=43.8
+                        ),
+                    ]
+                )
+            ]
+        )
+
+        self.assertEqual(
+            _collapsed_prefix_retry_offset(segments, transcription),
+            20.0,
+        )
+
+    def test_ignores_isolated_early_match_when_choosing_retry_offset(self):
+        segments = [
+            SimpleNamespace(text=text, start=0.0, end=0.0, words=[])
+            for text in [
+                "alpha bravo",
+                "charlie delta",
+                "echo foxtrot",
+                "golf hotel",
+            ]
+        ]
+        transcript_words = [
+            SimpleNamespace(word="alpha", start=11.0, end=11.7),
+            SimpleNamespace(word=" bravo", start=11.8, end=12.6),
+            SimpleNamespace(word="charlie", start=41.0, end=41.8),
+            SimpleNamespace(word=" delta", start=41.9, end=42.7),
+            SimpleNamespace(word="echo", start=46.0, end=46.7),
+            SimpleNamespace(word=" foxtrot", start=46.8, end=47.7),
+            SimpleNamespace(word="golf", start=51.0, end=51.7),
+            SimpleNamespace(word=" hotel", start=51.8, end=52.6),
+        ]
+        transcription = SimpleNamespace(
+            segments=[SimpleNamespace(words=transcript_words)]
+        )
+
+        self.assertEqual(
+            _collapsed_prefix_retry_offset(segments, transcription),
+            20.0,
+        )
+
+    def test_ends_before_stray_word_after_instrumental_gap(self):
+        segment = SimpleNamespace(
+            start=150.0,
+            end=176.0,
+            words=[
+                SimpleNamespace(word="Joe", start=150.0, end=150.8),
+                SimpleNamespace(word=" Joe", start=150.9, end=151.7),
+                SimpleNamespace(word=" Joe", start=175.0, end=176.0),
+            ],
+        )
+
+        self.assertEqual(_segment_end(segment), 151.7)
 
     def test_preserves_coherent_tail_after_instrumental_break(self):
         starts = [116.40, 118.22, 119.90, 121.78, 123.94, 125.76, 127.58, 129.26, 142.20, 144.70]

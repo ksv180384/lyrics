@@ -3,6 +3,7 @@ import os
 import re
 import statistics
 import subprocess
+import tempfile
 import unicodedata
 import uuid
 import traceback
@@ -209,6 +210,14 @@ def _segment_end(seg) -> float:
     words = _spoken_words(seg)
     if not words:
         return float(seg.end)
+    for index in range(1, len(words)):
+        gap = float(words[index].start) - float(words[index - 1].end)
+        prefix_duration = sum(
+            max(0.0, float(word.end) - float(word.start))
+            for word in words[:index]
+        )
+        if gap > 5.0 and prefix_duration >= 0.5:
+            return float(words[index - 1].end)
     if _late_word_group_index(words) is not None:
         last = words[-1]
         return min(float(last.end), float(last.start) + 0.5)
@@ -680,6 +689,98 @@ def _needs_transcription_refinement(segments: list, duration: float) -> bool:
     return duration - reliable_end > max(20.0, duration * 0.15)
 
 
+def _has_severely_collapsed_prefix(segments: list) -> bool:
+    """Detect when many opening lyric lines were squeezed into the intro."""
+    prefix = segments[:min(12, len(segments))]
+    if len(prefix) < 8:
+        return False
+    starts = [_segment_start(segment) for segment in prefix]
+    collapsed = sum(
+        1
+        for segment in prefix
+        if _segment_end(segment) - _segment_start(segment) <= 0.25
+    )
+    return collapsed >= 4 and starts[-1] - starts[0] <= 20
+
+
+def _collapsed_prefix_retry_offset(segments: list, transcription) -> float:
+    """Choose a safe point before the first reliable lyric match."""
+    transcript_words = [
+        word
+        for segment in transcription.segments
+        for word in (getattr(segment, 'words', None) or [])
+        if getattr(word, 'word', '').strip()
+    ]
+    candidate_points = []
+    for line_index, segment in enumerate(segments[:min(12, len(segments))]):
+        for candidate in _transcription_candidates(segment, transcript_words):
+            _, _, similarity, start, end = candidate
+            if similarity >= 0.88 and end - start <= 8:
+                candidate_points.append((line_index, start))
+    if not candidate_points:
+        return 0.0
+
+    clustered_starts = [
+        start
+        for _, start in candidate_points
+        if len({
+            line_index
+            for line_index, other_start in candidate_points
+            if start <= other_start <= start + 20
+        }) >= 3
+    ]
+    first_reliable_start = min(clustered_starts or [
+        start for _, start in candidate_points
+    ])
+    return min(20.0, max(0.0, first_reliable_start - 10.0))
+
+
+def _realign_after_collapsed_prefix(
+    model,
+    audio_path: str,
+    lyrics: str,
+    language: str,
+    segments: list,
+    transcription,
+):
+    """Retry alignment after removing an instrumental intro that trapped lyrics."""
+    offset = _collapsed_prefix_retry_offset(segments, transcription)
+    if offset < 3:
+        return None
+
+    suffix = os.path.splitext(audio_path)[1] or '.mp3'
+    handle = tempfile.NamedTemporaryFile(suffix=suffix, delete=False)
+    clipped_path = handle.name
+    handle.close()
+    try:
+        subprocess.run(
+            [
+                'ffmpeg', '-y', '-ss', f'{offset:.3f}', '-i', audio_path,
+                '-map', '0:a:0', '-vn', '-c:a', 'copy', clipped_path,
+            ],
+            capture_output=True,
+            check=True,
+        )
+        recovered = model.align(
+            clipped_path,
+            lyrics,
+            language=language,
+            original_split=True,
+        )
+        if recovered is None:
+            return None
+        recovered.offset_time(offset)
+        recovered_segments = list(recovered.segments)
+        if _has_severely_collapsed_prefix(recovered_segments):
+            return None
+        return recovered
+    finally:
+        try:
+            os.remove(clipped_path)
+        except OSError:
+            pass
+
+
 def _build_line_start_times(
     lines_fr: list,
     segments: list,
@@ -797,7 +898,28 @@ def align_multilang_lrc(
     if _needs_transcription_refinement(segments, duration):
         print('Suspicious alignment gap detected; verifying timestamps with transcription...')
         transcription = m.transcribe(audio_path, language=language, regroup=False)
-        segment_starts, segment_ends = _refine_segment_boundaries(segments, transcription, duration)
+        recovered_prefix = False
+        if _has_severely_collapsed_prefix(segments):
+            print('Collapsed lyric prefix detected; retrying after the instrumental intro...')
+            recovered = _realign_after_collapsed_prefix(
+                m,
+                audio_path,
+                lyrics_fr,
+                language,
+                segments,
+                transcription,
+            )
+            if recovered is not None:
+                segments = list(recovered.segments)
+                segment_starts = [_segment_start(seg) for seg in segments]
+                segment_ends = [_segment_end(seg) for seg in segments]
+                recovered_prefix = True
+        if not recovered_prefix and _needs_transcription_refinement(segments, duration):
+            segment_starts, segment_ends = _refine_segment_boundaries(
+                segments,
+                transcription,
+                duration,
+            )
     starts = _build_line_start_times(lines_fr, segments, segment_starts, segment_ends)
     first_lyric_start = next(starts[i] for i, line in enumerate(lines_fr) if line.strip())
     lyric_end = max(segment_ends)
