@@ -2,10 +2,14 @@ import unittest
 from types import SimpleNamespace
 
 from app import (
+    _build_line_start_times,
+    _is_section_label,
+    _lyrics_for_alignment,
     _collapsed_prefix_retry_offset,
     _has_severely_collapsed_prefix,
     _ordered_transcription_matches,
     _repair_collapsed_segments_before_late_groups,
+    _repair_repeated_segment_starts,
     _repair_repeated_text_blocks,
     _repair_untrusted_ranges,
     _segment_end,
@@ -239,6 +243,66 @@ class RepeatedBlockRepairTests(unittest.TestCase):
         )
 
         self.assertEqual(repaired_starts[-2:], [142.20, 144.70])
+
+
+class SectionLabelTests(unittest.TestCase):
+    def test_excludes_section_label_from_alignment_text(self):
+        lines_fr = ["first line", "", "[Post-refrain]", "second line"]
+
+        self.assertTrue(_is_section_label("[Post-refrain]"))
+        self.assertFalse(_is_section_label("[00:12.34]actual lyric"))
+        self.assertEqual(_lyrics_for_alignment(lines_fr), "first line\n\n\nsecond line")
+
+    def test_section_label_uses_next_vocal_start(self):
+        lines_fr = ["first line", "", "[Post-refrain]", "second line"]
+        segments = [
+            SimpleNamespace(start=10.0, end=12.0, words=[]),
+            SimpleNamespace(start=20.0, end=22.0, words=[]),
+        ]
+
+        starts = _build_line_start_times(
+            lines_fr, segments, [10.0, 20.0], [12.0, 22.0]
+        )
+
+        self.assertEqual(starts, [10.0, 12.0, 20.0, 20.0])
+
+
+class AdjacentRepeatRecoveryTests(unittest.TestCase):
+    def test_recovers_all_occurrences_after_stretched_repeat(self):
+        segments = [
+            SimpleNamespace(text="Balance ton quoi (Ah-ah)", start=151.0, end=168.0, words=[]),
+            SimpleNamespace(text="Balance ton quoi (Ah-ah)", start=169.0, end=170.0, words=[]),
+            SimpleNamespace(text="Balance ton quoi", start=170.0, end=170.0, words=[]),
+        ]
+        transcript_words = []
+        for start in (151.0, 156.5, 168.4):
+            transcript_words.extend([
+                SimpleNamespace(word="Balance", start=start, end=start + 0.5),
+                SimpleNamespace(word=" ton", start=start + 0.5, end=start + 0.8),
+                SimpleNamespace(word=" quoi", start=start + 0.8, end=start + 1.2),
+            ])
+
+        matches = _ordered_transcription_matches(segments, transcript_words)
+
+        self.assertEqual(
+            [round(matches[index][1], 1) for index in range(3)],
+            [151.0, 156.5, 168.4],
+        )
+
+
+    def test_preserves_trusted_irregular_repeat_cadence(self):
+        segments = [
+            SimpleNamespace(text="Balance ton quoi", start=start, end=end, words=[])
+            for start, end in [(151.0, 153.0), (160.0, 162.0), (168.4, 170.0)]
+        ]
+        starts = [151.0, 160.0, 168.4]
+        ends = [153.0, 162.0, 170.0]
+
+        repaired_starts, _ = _repair_repeated_segment_starts(
+            segments, starts.copy(), ends.copy(), 180.0, {0, 1, 2}
+        )
+
+        self.assertEqual(repaired_starts, starts)
 
 
 if __name__ == "__main__":

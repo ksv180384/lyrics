@@ -7,6 +7,7 @@ import tempfile
 import unicodedata
 import uuid
 import traceback
+from itertools import combinations
 from difflib import SequenceMatcher
 from datetime import datetime, timezone
 
@@ -150,6 +151,21 @@ def _split_lines_preserve(text: str) -> list:
 def _nonempty_line_count(lines: list) -> int:
     """Подсчитывает количество непустых строк текста."""
     return sum(1 for ln in lines if ln.strip())
+
+
+def _is_section_label(line: str) -> bool:
+    """Определяет служебную пометку секции, которая не произносится в аудио."""
+    return bool(re.fullmatch(r'\s*\[[^\[\]\n]+\]\s*', line or ''))
+
+
+def _is_spoken_lyric_line(line: str) -> bool:
+    """Возвращает True только для строки, которую нужно выравнивать с вокалом."""
+    return bool((line or '').strip()) and not _is_section_label(line)
+
+
+def _lyrics_for_alignment(lines: list) -> str:
+    """Сохраняет разбиение текста, исключая из alignment служебные пометки."""
+    return '\n'.join(line if _is_spoken_lyric_line(line) else '' for line in lines)
 
 
 def _spoken_words(seg) -> list:
@@ -314,17 +330,48 @@ def _transcription_candidates(segment, transcript_words: list) -> list:
 
 def _ordered_transcription_matches(segments: list, transcript_words: list) -> dict:
     """Находит максимальную цепочку непересекающихся строк в порядке песни."""
+    normalized_lines = [_normalize_for_match(segment.text) for segment in segments]
+    relaxed_repeat_windows = {}
+    run_start = 0
+    while run_start < len(segments):
+        run_end = run_start + 1
+        while (
+            run_end < len(segments)
+            and normalized_lines[run_end] == normalized_lines[run_start]
+        ):
+            run_end += 1
+        if run_end - run_start >= 2 and any(
+            float(segments[index].end) - float(segments[index].start) > 10
+            for index in range(run_start, run_end)
+        ):
+            window = (
+                min(_segment_start(segments[index]) for index in range(run_start, run_end)) - 3,
+                max(float(segments[index].end) for index in range(run_start, run_end)) + 3,
+            )
+            for index in range(run_start, run_end):
+                relaxed_repeat_windows[index] = window
+        run_start = run_end
+
     nodes = []
     for line_index, segment in enumerate(segments):
         forced_start = _segment_start(segment)
         segment_is_stretched = float(segment.end) - float(segment.start) > 10
+        repeat_window = relaxed_repeat_windows.get(line_index)
         for candidate in _transcription_candidates(segment, transcript_words):
             # Repeated chorus lines can match several real occurrences. A far
             # match is useful only when forced alignment itself stretched this
             # segment across an instrumental passage.
-            if not segment_is_stretched and abs(candidate[3] - forced_start) > 5:
+            if repeat_window is not None and not (
+                repeat_window[0] <= candidate[3] <= repeat_window[1]
+            ):
                 continue
-            if segment_is_stretched and not (
+            if (
+                repeat_window is None
+                and not segment_is_stretched
+                and abs(candidate[3] - forced_start) > 5
+            ):
+                continue
+            if repeat_window is None and segment_is_stretched and not (
                 forced_start - 3 <= candidate[3] <= float(segment.end) + 3
             ):
                 continue
@@ -333,7 +380,6 @@ def _ordered_transcription_matches(segments: list, transcript_words: list) -> di
     # Уникальные строки служат более сильными опорами, чем короткие повторы
     # припева: иначе длинная цепочка из одних «почему» может перескочить через
     # точно распознанный мост песни.
-    normalized_lines = [_normalize_for_match(segment.text) for segment in segments]
     occurrence_counts = {
         text: normalized_lines.count(text)
         for text in set(normalized_lines)
@@ -365,6 +411,54 @@ def _ordered_transcription_matches(segments: list, transcript_words: list) -> di
         line_index, _, _, similarity, start, end = nodes[cursor]
         matches[line_index] = (similarity, start, end)
         cursor = previous[cursor]
+
+    # Глобальная цепочка иногда пропускает соседний повтор ради более
+    # сильной дальней опоры. Для растянутой серии выбираем локально первые
+    # непересекающиеся появления — так сохраняются реальные паузы припева.
+    run_start = 0
+    while run_start < len(segments):
+        run_end = run_start + 1
+        while (
+            run_end < len(segments)
+            and normalized_lines[run_end] == normalized_lines[run_start]
+        ):
+            run_end += 1
+        repeat_window = relaxed_repeat_windows.get(run_start)
+        run_length = run_end - run_start
+        if repeat_window is not None:
+            candidates = sorted(
+                (
+                    candidate
+                    for candidate in _transcription_candidates(
+                        segments[run_start], transcript_words
+                    )
+                    if repeat_window[0] <= candidate[3] <= repeat_window[1]
+                ),
+                key=lambda candidate: (candidate[0], candidate[1], -candidate[2]),
+            )
+            viable_chains = [
+                chain
+                for chain in combinations(candidates, run_length)
+                if (
+                    all(left[1] <= right[0] for left, right in zip(chain, chain[1:]))
+                    and abs(
+                        chain[-1][3] - _segment_start(segments[run_end - 1])
+                    ) <= 3
+                )
+            ]
+            if viable_chains:
+                chain = min(
+                    viable_chains,
+                    key=lambda candidate_chain: (
+                        candidate_chain[-1][1],
+                        candidate_chain[0][0],
+                        -sum(candidate[2] for candidate in candidate_chain),
+                    ),
+                )
+                for offset, candidate in enumerate(chain):
+                    _, _, similarity, start, end = candidate
+                    matches[run_start + offset] = (similarity, start, end)
+        run_start = run_end
     return matches
 
 
@@ -415,8 +509,10 @@ def _repair_repeated_segment_starts(
     starts: list,
     ends: list,
     duration: float,
+    trusted: set = None,
 ) -> tuple:
     """Восстанавливает равномерный ритм серий, где alignment пропустил повторы."""
+    trusted = trusted or set()
     run_start = 0
     while run_start < len(segments):
         run_end = run_start + 1
@@ -426,7 +522,9 @@ def _repair_repeated_segment_starts(
         ):
             run_end += 1
 
-        if run_end - run_start >= 3:
+        if run_end - run_start >= 3 and not all(
+            index in trusted for index in range(run_start, run_end)
+        ):
             deltas = [
                 starts[i + 1] - starts[i]
                 for i in range(run_start, run_end - 1)
@@ -659,6 +757,7 @@ def _refine_segment_boundaries(segments: list, transcription, duration: float) -
         starts,
         ends,
         duration,
+        trusted,
     )
     return _repair_repeated_text_blocks(segments, starts, ends)
 
@@ -805,18 +904,20 @@ def _build_line_start_times(
     if ns == n:
         return segment_starts
 
-    n_ne = _nonempty_line_count(lines_fr)
-    if ns != n_ne:
+    n_spoken = sum(1 for line in lines_fr if _is_spoken_lyric_line(line))
+    if ns != n_spoken:
         raise ValueError(
-            f'После выравнивания сегментов {ns}, непустых строк во FR {n_ne}, всего строк {n}. '
-            'Число непустых строк должно совпадать с числом сегментов. '
+            f'После выравнивания сегментов {ns}, произносимых строк во FR {n_spoken}, всего строк {n}. '
+            'Число произносимых строк должно совпадать с числом сегментов. '
             'Уберите лишние переносы или проверьте, что текст FR совпадает с песней.'
         )
 
     times = [0.0] * n
     j = 0
     for i in range(n):
-        if not lines_fr[i].strip():
+        if _is_section_label(lines_fr[i]):
+            times[i] = segment_starts[j] if j < ns else segment_ends[-1]
+        elif not lines_fr[i].strip():
             if j > 0:
                 times[i] = segment_ends[j - 1]
             else:
@@ -889,7 +990,8 @@ def align_multilang_lrc(
         raise ValueError('Текст FR пуст')
 
     m = get_model()
-    result = m.align(audio_path, lyrics_fr, language=language, original_split=True)
+    alignment_lyrics = _lyrics_for_alignment(lines_fr)
+    result = m.align(audio_path, alignment_lyrics, language=language, original_split=True)
     segments = list(result.segments)
     segment_starts = [_segment_start(seg) for seg in segments]
     segment_ends = [_segment_end(seg) for seg in segments]
@@ -904,7 +1006,7 @@ def align_multilang_lrc(
             recovered = _realign_after_collapsed_prefix(
                 m,
                 audio_path,
-                lyrics_fr,
+                alignment_lyrics,
                 language,
                 segments,
                 transcription,
@@ -921,7 +1023,10 @@ def align_multilang_lrc(
                 duration,
             )
     starts = _build_line_start_times(lines_fr, segments, segment_starts, segment_ends)
-    first_lyric_start = next(starts[i] for i, line in enumerate(lines_fr) if line.strip())
+    first_lyric_start = next(
+        starts[i] for i, line in enumerate(lines_fr)
+        if _is_spoken_lyric_line(line)
+    )
     lyric_end = max(segment_ends)
     duration = max(duration, lyric_end)
     label = _song_label(artist, title)
