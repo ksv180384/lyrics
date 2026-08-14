@@ -762,6 +762,145 @@ def _refine_segment_boundaries(segments: list, transcription, duration: float) -
     return _repair_repeated_text_blocks(segments, starts, ends)
 
 
+def _broken_suffix_start(
+    segments: list,
+    starts: list,
+    duration: float,
+):
+    """Find a late block that jumped forward before a collapsed tail."""
+    if len(segments) < 8 or len(starts) != len(segments):
+        return None
+    tail_start = max(0, len(segments) - 24)
+    collapsed_tail = [
+        index
+        for index in range(tail_start, len(segments))
+        if (
+            _segment_end(segments[index]) - _segment_start(segments[index]) <= 0.25
+            or starts[index] >= duration - 0.25
+        )
+    ]
+    if len(collapsed_tail) < 4:
+        return None
+
+    first_collapsed = min(collapsed_tail)
+    forced_starts = [_segment_start(segment) for segment in segments]
+    gaps = []
+    for index in range(1, first_collapsed):
+        gap = max(
+            starts[index] - starts[index - 1],
+            forced_starts[index] - forced_starts[index - 1],
+        )
+        if gap > 10:
+            gaps.append((gap, index))
+    if not gaps:
+        return None
+    _, right = max(gaps)
+    return max(1, right - 1)
+
+
+def _realign_broken_suffix(
+    model,
+    audio_path: str,
+    language: str,
+    segments: list,
+    starts: list,
+    ends: list,
+    duration: float,
+):
+    """Retry only a displaced suffix after the last reliable boundary."""
+    suffix_index = _broken_suffix_start(segments, starts, duration)
+    if suffix_index is None:
+        return None
+    offset = max(0.0, min(duration - 1.0, ends[suffix_index - 1] - 1.0))
+    suffix_lyrics = '\n'.join(
+        str(segment.text).strip() for segment in segments[suffix_index:]
+    )
+    suffix = '.wav'
+    handle = tempfile.NamedTemporaryFile(suffix=suffix, delete=False)
+    clipped_path = handle.name
+    handle.close()
+    try:
+        subprocess.run(
+            [
+                'ffmpeg', '-y', '-ss', f'{offset:.3f}', '-i', audio_path,
+                '-map', '0:a:0', '-vn', '-c:a', 'pcm_s16le', clipped_path,
+            ],
+            capture_output=True,
+            check=True,
+        )
+        recovered = model.align(
+            clipped_path,
+            suffix_lyrics,
+            language=language,
+            original_split=True,
+        )
+        if recovered is None:
+            return None
+        recovered.offset_time(offset)
+        recovered_segments = list(recovered.segments)
+        if len(recovered_segments) != len(segments) - suffix_index:
+            return None
+        recovered_starts = [_segment_start(segment) for segment in recovered_segments]
+        collapsed = sum(
+            1
+            for segment in recovered_segments
+            if _segment_end(segment) - _segment_start(segment) <= 0.25
+        )
+        if (
+            collapsed > 2
+            or recovered_starts[0] < starts[suffix_index - 1] - 0.5
+            or recovered_starts[0] > starts[suffix_index - 1] + 10
+            or any(
+                current < previous
+                for previous, current in zip(recovered_starts, recovered_starts[1:])
+            )
+        ):
+            return None
+        return suffix_index, recovered_segments
+    finally:
+        try:
+            os.remove(clipped_path)
+        except OSError:
+            pass
+
+
+def _finalize_segment_boundaries(
+    starts: list,
+    ends: list,
+    duration: float,
+) -> tuple:
+    """Keep repaired timestamps monotonic and inside the real audio."""
+    starts = [min(duration, max(0.0, float(start))) for start in starts]
+    ends = [min(duration, max(0.0, float(end))) for end in ends]
+    trailing = len(starts)
+    while trailing > 0 and (
+        starts[trailing - 1] >= duration - 0.05
+        and ends[trailing - 1] - starts[trailing - 1] <= 0.10
+    ):
+        trailing -= 1
+    trailing_count = len(starts) - trailing
+    if 0 < trailing_count <= 3 and trailing > 0:
+        deltas = [
+            starts[index] - starts[index - 1]
+            for index in range(max(1, trailing - 5), trailing)
+            if 0.5 <= starts[index] - starts[index - 1] <= 5.0
+        ]
+        cadence = statistics.median(deltas) if deltas else 1.0
+        available = max(0.0, duration - starts[trailing - 1])
+        cadence = min(cadence, available / (trailing_count + 0.25))
+        for offset, index in enumerate(range(trailing, len(starts)), start=1):
+            starts[index] = min(duration - 0.01, starts[trailing - 1] + cadence * offset)
+            ends[index] = duration
+
+    for index in range(1, len(starts)):
+        starts[index] = max(starts[index], starts[index - 1])
+    for index in range(len(ends)):
+        ends[index] = max(starts[index], min(duration, ends[index]))
+        if index + 1 < len(starts):
+            ends[index] = min(ends[index], starts[index + 1])
+    return starts, ends
+
+
 def _needs_transcription_refinement(segments: list, duration: float) -> bool:
     """Ищет разрывы, сжатие текста и растянутые до конца файла слова."""
     if any(_segment_start(current) - _segment_end(previous) > 10 for previous, current in zip(segments, segments[1:])):
@@ -793,6 +932,18 @@ def _has_severely_collapsed_prefix(segments: list) -> bool:
     prefix = segments[:min(12, len(segments))]
     if len(prefix) < 8:
         return False
+    leading_collapsed = 0
+    for segment in prefix:
+        if _segment_end(segment) - _segment_start(segment) > 0.25:
+            break
+        leading_collapsed += 1
+    if (
+        leading_collapsed >= 3
+        and leading_collapsed < len(prefix)
+        and _segment_start(prefix[leading_collapsed])
+        - _segment_end(prefix[leading_collapsed - 1]) > 10
+    ):
+        return True
     starts = [_segment_start(segment) for segment in prefix]
     collapsed = sum(
         1
@@ -847,7 +998,7 @@ def _realign_after_collapsed_prefix(
     if offset < 3:
         return None
 
-    suffix = os.path.splitext(audio_path)[1] or '.mp3'
+    suffix = '.wav'
     handle = tempfile.NamedTemporaryFile(suffix=suffix, delete=False)
     clipped_path = handle.name
     handle.close()
@@ -855,7 +1006,7 @@ def _realign_after_collapsed_prefix(
         subprocess.run(
             [
                 'ffmpeg', '-y', '-ss', f'{offset:.3f}', '-i', audio_path,
-                '-map', '0:a:0', '-vn', '-c:a', 'copy', clipped_path,
+                '-map', '0:a:0', '-vn', '-c:a', 'pcm_s16le', clipped_path,
             ],
             capture_output=True,
             check=True,
@@ -962,8 +1113,11 @@ def _build_lrc(
     ]
     for i, line in enumerate(lines):
         out.append(_lrc_line(format_lrc_timestamp(starts[i]), line))
-    out.append(_lrc_line(format_lrc_timestamp(lyric_end), ''))
-    out.append(_lrc_line(format_lrc_timestamp(duration), ''))
+    lyric_end_tag = format_lrc_timestamp(lyric_end)
+    duration_tag = format_lrc_timestamp(duration)
+    out.append(_lrc_line(lyric_end_tag, ""))
+    if duration_tag != lyric_end_tag:
+        out.append(_lrc_line(duration_tag, ""))
     return "\n".join(out) + "\n"
 
 
@@ -1022,13 +1176,34 @@ def align_multilang_lrc(
                 transcription,
                 duration,
             )
+            recovered_suffix = _realign_broken_suffix(
+                m,
+                audio_path,
+                language,
+                segments,
+                segment_starts,
+                segment_ends,
+                duration,
+            )
+            if recovered_suffix is not None:
+                suffix_index, suffix_segments = recovered_suffix
+                print('Displaced lyric suffix detected; retrying from the last reliable boundary...')
+                segment_starts[suffix_index:] = [
+                    _segment_start(segment) for segment in suffix_segments
+                ]
+                segment_ends[suffix_index:] = [
+                    _segment_end(segment) for segment in suffix_segments
+                ]
+    segment_starts, segment_ends = _finalize_segment_boundaries(
+        segment_starts, segment_ends, duration
+    )
     starts = _build_line_start_times(lines_fr, segments, segment_starts, segment_ends)
     first_lyric_start = next(
         starts[i] for i, line in enumerate(lines_fr)
         if _is_spoken_lyric_line(line)
     )
     lyric_end = max(segment_ends)
-    duration = max(duration, lyric_end)
+    lyric_end = min(duration, lyric_end)
     label = _song_label(artist, title)
 
     return (

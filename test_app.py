@@ -2,6 +2,8 @@ import unittest
 from types import SimpleNamespace
 
 from app import (
+    _broken_suffix_start,
+    _finalize_segment_boundaries,
     _build_line_start_times,
     _is_section_label,
     _lyrics_for_alignment,
@@ -159,6 +161,40 @@ class RepeatedBlockRepairTests(unittest.TestCase):
 
         self.assertTrue(_has_severely_collapsed_prefix(segments))
 
+    def test_detects_three_collapsed_opening_lines_before_large_gap(self):
+        segments = [
+            SimpleNamespace(text=f"line {index}", start=2.2, end=2.24, words=[])
+            for index in range(3)
+        ]
+        segments.extend(
+            SimpleNamespace(
+                text=f"line {index}",
+                start=24.48 + index * 2,
+                end=25.08 + index * 2,
+                words=[],
+            )
+            for index in range(5)
+        )
+
+        self.assertTrue(_has_severely_collapsed_prefix(segments))
+
+    def test_ignores_only_two_collapsed_opening_lines(self):
+        segments = [
+            SimpleNamespace(text="line 0", start=2.2, end=2.24, words=[]),
+            SimpleNamespace(text="line 1", start=2.24, end=2.24, words=[]),
+        ]
+        segments.extend(
+            SimpleNamespace(
+                text=f"line {index}",
+                start=24.48 + index * 2,
+                end=25.08 + index * 2,
+                words=[],
+            )
+            for index in range(6)
+        )
+
+        self.assertFalse(_has_severely_collapsed_prefix(segments))
+
     def test_caps_intro_retry_at_twenty_seconds(self):
         segments = [
             SimpleNamespace(
@@ -303,6 +339,44 @@ class AdjacentRepeatRecoveryTests(unittest.TestCase):
         )
 
         self.assertEqual(repaired_starts, starts)
+
+
+class BrokenSuffixRecoveryTests(unittest.TestCase):
+    @staticmethod
+    def _segments(collapsed_tail=True):
+        segments = [
+            SimpleNamespace(text=f"line {index}", start=index * 2.0, end=index * 2.0 + 1.0, words=[])
+            for index in range(15)
+        ]
+        if collapsed_tail:
+            for index in range(11, 15):
+                segments[index].start = 40.0
+                segments[index].end = 40.0
+        return segments
+
+    def test_finds_boundary_before_large_jump_and_collapsed_tail(self):
+        segments = self._segments()
+        starts = [float(index * 2) for index in range(10)] + [32.0, 40.0, 40.0, 40.0, 40.0]
+
+        self.assertEqual(_broken_suffix_start(segments, starts, 45.0), 9)
+
+    def test_ignores_instrumental_gap_without_collapsed_tail(self):
+        segments = self._segments(collapsed_tail=False)
+        starts = [float(index * 2) for index in range(10)] + [32.0, 34.0, 36.0, 38.0, 40.0]
+
+        self.assertIsNone(_broken_suffix_start(segments, starts, 45.0))
+
+    def test_backfills_last_failed_line_inside_real_duration(self):
+        starts, ends = _finalize_segment_boundaries(
+            [209.78, 211.70, 212.74, 216.18, 218.54],
+            [211.16, 212.74, 213.90, 218.53, 218.54],
+            218.54,
+        )
+
+        self.assertGreater(starts[-1], starts[-2])
+        self.assertLess(starts[-1], 218.54)
+        self.assertEqual(ends[-1], 218.54)
+        self.assertEqual(starts, sorted(starts))
 
 
 if __name__ == "__main__":
