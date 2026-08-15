@@ -2,6 +2,10 @@ import unittest
 from types import SimpleNamespace
 
 from app import (
+    _collapsed_adjacent_duplicate_range,
+    _collapsed_transcription_retry_start,
+    _remove_spoken_segment_range,
+    _repair_repeated_blocks_before_late_anchor,
     _broken_suffix_start,
     _finalize_segment_boundaries,
     _build_line_start_times,
@@ -12,6 +16,7 @@ from app import (
     _ordered_transcription_matches,
     _repair_collapsed_segments_before_late_groups,
     _repair_repeated_segment_starts,
+    _repair_collapsed_repeated_tail,
     _repair_repeated_text_blocks,
     _repair_untrusted_ranges,
     _segment_end,
@@ -40,6 +45,45 @@ class RepeatedBlockRepairTests(unittest.TestCase):
 
         self.assertAlmostEqual(repaired_starts[10], 116.40, places=2)
         self.assertAlmostEqual(repaired_starts[17], 129.26, places=2)
+
+    def test_uses_refined_starts_to_infer_repeat_shift(self):
+        texts = ["lead", "a", "b", "c", "middle", "a", "b", "c", "tail"]
+        refined_starts = [0.0, 10.0, 12.0, 14.0, 20.0, 40.0, 42.0, 60.0, 70.0]
+        forced_starts = [0.0, 10.0, 12.0, 14.0, 20.0, 30.0, 30.0, 30.0, 70.0]
+        ends = [start + 1.0 for start in refined_starts]
+        segments = [
+            SimpleNamespace(text=text, start=start, end=end, words=[])
+            for text, start, end in zip(texts, forced_starts, ends)
+        ]
+
+        repaired_starts, _ = _repair_repeated_text_blocks(
+            segments,
+            refined_starts.copy(),
+            ends.copy(),
+        )
+
+        self.assertEqual(repaired_starts[5:8], [40.0, 42.0, 44.0])
+
+    def test_prefers_trusted_shift_over_larger_untrusted_cluster(self):
+        block = ["a", "b", "c", "d", "e"]
+        texts = ["lead", *block, "middle", *block, "tail"]
+        source = [10.0, 14.0, 17.0, 21.0, 23.0]
+        destination = [72.0, 76.0, 72.0, 83.0, 85.0]
+        starts = [0.0, *source, 30.0, *destination, 100.0]
+        ends = [start + 1.0 for start in starts]
+        segments = [
+            SimpleNamespace(text=text, start=start, end=end, words=[])
+            for text, start, end in zip(texts, starts, ends)
+        ]
+
+        repaired_starts, _ = _repair_repeated_text_blocks(
+            segments,
+            starts.copy(),
+            ends.copy(),
+            trusted={9},
+        )
+
+        self.assertEqual(repaired_starts[7:12], [65.0, 69.0, 72.0, 76.0, 78.0])
 
     def test_ignores_far_match_for_reliable_repeated_line(self):
         segments = [
@@ -339,6 +383,111 @@ class AdjacentRepeatRecoveryTests(unittest.TestCase):
         )
 
         self.assertEqual(repaired_starts, starts)
+
+
+class AdjacentDuplicateStanzaTests(unittest.TestCase):
+    @staticmethod
+    def _segments(collapsed=True):
+        texts = ["intro", "a", "b", "c", "a", "b", "c", "outro"]
+        starts = [0.0, 10.0, 12.0, 14.0, 20.0, 20.0, 20.0, 40.0]
+        ends = [1.0, 11.0, 13.0, 15.0, 20.0, 20.0, 20.0, 41.0]
+        if not collapsed:
+            starts[4:7] = [20.0, 22.0, 24.0]
+            ends[4:7] = [21.0, 23.0, 25.0]
+        return [
+            SimpleNamespace(text=text, start=start, end=end, words=[])
+            for text, start, end in zip(texts, starts, ends)
+        ]
+
+    def test_finds_only_the_collapsed_second_adjacent_copy(self):
+        self.assertEqual(
+            _collapsed_adjacent_duplicate_range(self._segments()),
+            (4, 7),
+        )
+        self.assertIsNone(
+            _collapsed_adjacent_duplicate_range(self._segments(collapsed=False))
+        )
+
+    def test_removes_matching_lines_in_all_languages(self):
+        fr = ["intro", "", "a", "b", "c", "", "a", "b", "c", "", "outro"]
+        ru = ["ru " + line if line else "" for line in fr]
+        tr = ["tr " + line if line else "" for line in fr]
+
+        filtered_fr, filtered_ru, filtered_tr = _remove_spoken_segment_range(
+            fr, ru, tr, (4, 7)
+        )
+
+        self.assertEqual(filtered_fr, ["intro", "", "a", "b", "c", "", "outro"])
+        self.assertEqual(len(filtered_fr), len(filtered_ru))
+        self.assertEqual(len(filtered_fr), len(filtered_tr))
+
+    def test_transcription_retry_starts_before_collapsed_run(self):
+        segments = [
+            SimpleNamespace(text=str(index), start=float(index), end=float(index + 1), words=[])
+            for index in range(6)
+        ]
+        for index in range(3, 6):
+            segments[index].end = segments[index].start
+
+        self.assertEqual(_collapsed_transcription_retry_start(segments), 1)
+
+
+class LateAnchorRepeatedBlockTests(unittest.TestCase):
+    def test_moves_collapsed_repeat_next_to_following_anchor(self):
+        texts = ["lead", "a", "b", "c", "anchor", "middle", "a", "b", "c", "late"]
+        starts = [0.0, 2.0, 4.0, 6.0, 8.0, 20.0, 22.0, 24.0, 26.0, 40.0]
+        ends = [start + 1.0 for start in starts]
+        segments = [
+            SimpleNamespace(text=text, start=start, end=end, words=[])
+            for text, start, end in zip(texts, starts, ends)
+        ]
+        segments[6].end = segments[6].start
+
+        repaired_starts, _ = _repair_repeated_blocks_before_late_anchor(
+            segments,
+            starts.copy(),
+            ends.copy(),
+        )
+
+        self.assertEqual(repaired_starts[6:9], [34.0, 36.0, 38.0])
+
+    def test_ignores_block_with_internal_duplicate_lines(self):
+        texts = ["lead", "a", "a", "b", "anchor", "middle", "a", "a", "b", "late"]
+        starts = [0.0, 2.0, 4.0, 6.0, 8.0, 20.0, 22.0, 24.0, 26.0, 40.0]
+        ends = [start + 1.0 for start in starts]
+        segments = [
+            SimpleNamespace(text=text, start=start, end=end, words=[])
+            for text, start, end in zip(texts, starts, ends)
+        ]
+        segments[6].end = segments[6].start
+
+        repaired_starts, _ = _repair_repeated_blocks_before_late_anchor(
+            segments,
+            starts.copy(),
+            ends.copy(),
+        )
+
+        self.assertEqual(repaired_starts, starts)
+
+
+class CollapsedRepeatedTailTests(unittest.TestCase):
+    def test_preserves_gap_and_backfills_only_final_series(self):
+        texts = ["other", "repeat", "repeat", "other", "repeat", "repeat", "repeat", "repeat"]
+        starts = [0.0, 10.0, 14.0, 20.0, 30.0, 60.0, 92.0, 93.0]
+        ends = [start + 1.0 for start in starts]
+        segments = [
+            SimpleNamespace(text=text, start=start, end=end, words=[])
+            for text, start, end in zip(texts, starts, ends)
+        ]
+
+        repaired_starts, _ = _repair_collapsed_repeated_tail(
+            segments,
+            starts.copy(),
+            ends.copy(),
+            100.0,
+        )
+
+        self.assertEqual(repaired_starts[4:], [30.0, 60.0, 64.0, 68.0])
 
 
 class BrokenSuffixRecoveryTests(unittest.TestCase):

@@ -328,9 +328,32 @@ def _transcription_candidates(segment, transcript_words: list) -> list:
     return sorted(candidates, key=lambda item: item[2], reverse=True)[:24]
 
 
-def _ordered_transcription_matches(segments: list, transcript_words: list) -> dict:
+def _collapsed_transcription_retry_start(segments: list):
+    """Return a safe retry point before a severe run of collapsed segments."""
+    run_start = 0
+    while run_start < len(segments):
+        run_end = run_start
+        while (
+            run_end < len(segments)
+            and _segment_end(segments[run_end]) - _segment_start(segments[run_end]) <= 0.35
+        ):
+            run_end += 1
+        if run_end - run_start >= 3:
+            return max(0, run_start - 2)
+        run_start = max(run_start + 1, run_end)
+    return None
+
+
+def _ordered_transcription_matches(
+    segments: list,
+    transcript_words: list,
+    allow_far_from=None,
+) -> dict:
     """Находит максимальную цепочку непересекающихся строк в порядке песни."""
     normalized_lines = [_normalize_for_match(segment.text) for segment in segments]
+    far_candidate_floor = 0.0
+    if allow_far_from is not None and allow_far_from > 0:
+        far_candidate_floor = _segment_end(segments[allow_far_from - 1]) - 1.0
     relaxed_repeat_windows = {}
     run_start = 0
     while run_start < len(segments):
@@ -358,20 +381,27 @@ def _ordered_transcription_matches(segments: list, transcript_words: list) -> di
         segment_is_stretched = float(segment.end) - float(segment.start) > 10
         repeat_window = relaxed_repeat_windows.get(line_index)
         for candidate in _transcription_candidates(segment, transcript_words):
+            allow_far = (
+                allow_far_from is not None and line_index >= allow_far_from
+            )
+            if allow_far and candidate[3] < far_candidate_floor:
+                continue
             # Repeated chorus lines can match several real occurrences. A far
             # match is useful only when forced alignment itself stretched this
-            # segment across an instrumental passage.
-            if repeat_window is not None and not (
+            # segment across an instrumental passage or a collapsed suffix is
+            # being recovered from the last reliable boundary.
+            if not allow_far and repeat_window is not None and not (
                 repeat_window[0] <= candidate[3] <= repeat_window[1]
             ):
                 continue
             if (
-                repeat_window is None
+                not allow_far
+                and repeat_window is None
                 and not segment_is_stretched
                 and abs(candidate[3] - forced_start) > 5
             ):
                 continue
-            if repeat_window is None and segment_is_stretched and not (
+            if not allow_far and repeat_window is None and segment_is_stretched and not (
                 forced_start - 3 <= candidate[3] <= float(segment.end) + 3
             ):
                 continue
@@ -496,6 +526,58 @@ def _recover_matches_before_large_gaps(
 
     return matches
 
+def _collapsed_adjacent_duplicate_range(segments: list):
+    """Find a second adjacent stanza copy that collapsed during alignment."""
+    normalized = [_normalize_for_match(segment.text) for segment in segments]
+    for length in range(min(8, len(segments) // 2), 2, -1):
+        for second_start in range(length, len(segments) - length + 1):
+            first_start = second_start - length
+            if (
+                normalized[first_start:second_start]
+                != normalized[second_start:second_start + length]
+            ):
+                continue
+            second = segments[second_start:second_start + length]
+            collapsed = sum(
+                1
+                for segment in second
+                if _segment_end(segment) - _segment_start(segment) <= 0.35
+            )
+            span = _segment_end(second[-1]) - _segment_start(second[0])
+            if collapsed >= length - 1 or span < max(1.0, length * 0.5):
+                return second_start, second_start + length
+    return None
+
+
+def _remove_spoken_segment_range(
+    lines_fr: list,
+    lines_ru: list,
+    lines_tr: list,
+    segment_range: tuple,
+) -> tuple:
+    """Remove the corresponding lines in all languages and collapse blank rows."""
+    spoken_line_indices = [
+        index
+        for index, line in enumerate(lines_fr)
+        if _is_spoken_lyric_line(line)
+    ]
+    start, end = segment_range
+    removed = set(spoken_line_indices[start:end])
+    filtered = ([], [], [])
+    for index, values in enumerate(zip(lines_fr, lines_ru, lines_tr)):
+        if index in removed:
+            continue
+        if (
+            not values[0].strip()
+            and filtered[0]
+            and not filtered[0][-1].strip()
+        ):
+            continue
+        for target, value in zip(filtered, values):
+            target.append(value)
+    return filtered
+
+
 def _same_repeated_phrase(left: str, right: str) -> bool:
     """Считает соседние полную и сокращённую формы припева одним повтором."""
     left_norm = _normalize_for_match(left)
@@ -521,6 +603,17 @@ def _repair_repeated_segment_starts(
             and _same_repeated_phrase(segments[run_end - 1].text, segments[run_end].text)
         ):
             run_end += 1
+
+        split_at = next(
+            (
+                index
+                for index in range(run_start + 1, run_end)
+                if starts[index] - starts[index - 1] > 12.0
+            ),
+            None,
+        )
+        if split_at is not None:
+            run_end = split_at
 
         if run_end - run_start >= 3 and not all(
             index in trusted for index in range(run_start, run_end)
@@ -559,6 +652,58 @@ def _repair_repeated_segment_starts(
         ends[i] = min(max(ends[i], starts[i]), starts[i + 1])
     if ends:
         ends[-1] = min(duration, max(ends[-1], starts[-1]))
+    return starts, ends
+
+
+def _repair_collapsed_repeated_tail(
+    segments: list,
+    starts: list,
+    ends: list,
+    duration: float,
+) -> tuple:
+    """Backfill a collapsed final repeat series after a real instrumental gap."""
+    if len(segments) < 4:
+        return starts, ends
+
+    normalized = [_normalize_for_match(segment.text) for segment in segments]
+    run_start = len(segments) - 1
+    while run_start > 0 and normalized[run_start - 1] == normalized[-1]:
+        run_start -= 1
+    if len(segments) - run_start < 3:
+        return starts, ends
+
+    split_at = next(
+        (
+            index
+            for index in range(run_start + 1, len(segments))
+            if starts[index] - starts[index - 1] > 12.0
+        ),
+        None,
+    )
+    if split_at is None or len(segments) - split_at < 3:
+        return starts, ends
+    if not any(
+        starts[index] - starts[index - 1] > 12.0
+        or starts[index] - starts[index - 1] < 0.5
+        for index in range(split_at + 1, len(segments))
+    ):
+        return starts, ends
+
+    cadences = [
+        starts[index] - starts[index - 1]
+        for index in range(1, split_at)
+        if (
+            normalized[index] == normalized[index - 1]
+            and 2.0 <= starts[index] - starts[index - 1] <= 6.0
+        )
+    ]
+    if not cadences:
+        return starts, ends
+    cadence = min(4.5, statistics.median(cadences))
+    anchor = starts[split_at]
+    for offset, index in enumerate(range(split_at, len(segments))):
+        starts[index] = min(duration, anchor + cadence * offset)
+        ends[index] = min(duration, starts[index] + min(1.5, cadence * 0.5))
     return starts, ends
 
 
@@ -614,8 +759,10 @@ def _repair_repeated_text_blocks(
     segments: list,
     starts: list,
     ends: list,
+    trusted: set = None,
 ) -> tuple:
     """Копирует проверенный ритм на поздний дословно повторяющийся блок."""
+    trusted = trusted or set()
     normalized = [_normalize_for_match(segment.text) for segment in segments]
     forced_starts = [_segment_start(segment) for segment in segments]
     destination = 1
@@ -671,7 +818,7 @@ def _repair_repeated_text_blocks(
         # beginning may align to an early instrumental while the final lines
         # align to the real vocals. Infer a shared shift from the entire block.
         shift_candidates = [
-            forced_starts[destination + i] - starts[source + i]
+            starts[destination + i] - starts[source + i]
             for i in range(length)
         ]
         shift_tolerance = 1.0
@@ -689,9 +836,19 @@ def _repair_repeated_text_blocks(
             if destination > 0 and source_gap_before is not None:
                 destination_gap_before = destination_start - ends[destination - 1]
                 context_error = abs(destination_gap_before - source_gap_before)
-            ranked_shifts.append((len(inliers), -context_error, shift))
+            trusted_inliers = sum(
+                1
+                for offset, candidate in enumerate(shift_candidates)
+                if (
+                    destination + offset in trusted
+                    and abs(candidate - candidate_shift) <= shift_tolerance
+                )
+            )
+            ranked_shifts.append(
+                (trusted_inliers, len(inliers), -context_error, shift)
+            )
 
-        _, _, block_shift = max(ranked_shifts)
+        _, _, _, block_shift = max(ranked_shifts)
         destination_start = source_start + block_shift
         for offset in range(length):
             starts[destination + offset] = (
@@ -707,10 +864,101 @@ def _repair_repeated_text_blocks(
     return starts, ends
 
 
+def _repair_repeated_blocks_before_late_anchor(
+    segments: list,
+    starts: list,
+    ends: list,
+) -> tuple:
+    """Move collapsed repeated blocks next to reliable following anchors."""
+    normalized = [_normalize_for_match(segment.text) for segment in segments]
+    while True:
+        candidates = []
+        for destination in range(1, len(segments) - 2):
+            for source in range(destination):
+                max_length = 0
+                while (
+                    destination + max_length < len(segments)
+                    and source + max_length < destination
+                    and normalized[source + max_length]
+                    == normalized[destination + max_length]
+                ):
+                    max_length += 1
+                for length in range(3, max_length + 1):
+                    if len(set(normalized[destination:destination + length])) < length:
+                        continue
+                    if destination + length >= len(segments):
+                        continue
+                    raw_destination = segments[destination:destination + length]
+                    if not any(
+                        _segment_end(segment) - _segment_start(segment) <= 0.35
+                        for segment in raw_destination
+                    ):
+                        continue
+                    source_gap_after = (
+                        starts[source + length] - starts[source + length - 1]
+                    )
+                    destination_gap_after = (
+                        starts[destination + length]
+                        - starts[destination + length - 1]
+                    )
+                    if (
+                        not 0.5 <= source_gap_after <= 10.0
+                        or destination_gap_after
+                        <= max(10.0, source_gap_after * 2.0)
+                    ):
+                        continue
+                    is_full_block_start = (
+                        source == 0
+                        or normalized[source - 1] != normalized[destination - 1]
+                    )
+                    candidates.append(
+                        (
+                            int(is_full_block_start),
+                            destination_gap_after / source_gap_after,
+                            length,
+                            destination,
+                            source,
+                            source_gap_after,
+                        )
+                    )
+        if not candidates:
+            break
+
+        _, _, length, destination, source, source_gap_after = max(candidates)
+        source_offsets = [
+            starts[source + offset] - starts[source]
+            for offset in range(length)
+        ]
+        destination_last = starts[destination + length] - source_gap_after
+        destination_start = destination_last - source_offsets[-1]
+        if destination > 0 and destination_start < ends[destination - 1]:
+            break
+        for offset in range(length):
+            index = destination + offset
+            starts[index] = destination_start + source_offsets[offset]
+            source_duration = max(
+                0.0,
+                ends[source + offset] - starts[source + offset],
+            )
+            next_start = (
+                destination_start + source_offsets[offset + 1]
+                if offset + 1 < length
+                else starts[destination + length]
+            )
+            ends[index] = min(next_start, starts[index] + source_duration)
+
+    return starts, ends
+
+
 def _refine_segment_boundaries(segments: list, transcription, duration: float) -> tuple:
     """Уточняет границы сегментов по уверенным совпадениям проверочной транскрипции."""
     transcript_words = [word for segment in transcription.segments for word in (getattr(segment, 'words', None) or []) if getattr(word, 'word', '').strip()]
-    matches = _ordered_transcription_matches(segments, transcript_words)
+    retry_start = _collapsed_transcription_retry_start(segments)
+    matches = _ordered_transcription_matches(
+        segments,
+        transcript_words,
+        allow_far_from=retry_start,
+    )
     matches = _recover_matches_before_large_gaps(
         segments,
         matches,
@@ -759,7 +1007,23 @@ def _refine_segment_boundaries(segments: list, transcription, duration: float) -
         duration,
         trusted,
     )
-    return _repair_repeated_text_blocks(segments, starts, ends)
+    starts, ends = _repair_repeated_text_blocks(
+        segments,
+        starts,
+        ends,
+        trusted,
+    )
+    starts, ends = _repair_collapsed_repeated_tail(
+        segments,
+        starts,
+        ends,
+        duration,
+    )
+    return _repair_repeated_blocks_before_late_anchor(
+        segments,
+        starts,
+        ends,
+    )
 
 
 def _broken_suffix_start(
@@ -783,6 +1047,8 @@ def _broken_suffix_start(
         return None
 
     first_collapsed = min(collapsed_tail)
+    if starts[first_collapsed] - starts[first_collapsed - 1] > 10:
+        return max(1, first_collapsed - 1)
     forced_starts = [_segment_start(segment) for segment in segments]
     gaps = []
     for index in range(1, first_collapsed):
@@ -1147,6 +1413,24 @@ def align_multilang_lrc(
     alignment_lyrics = _lyrics_for_alignment(lines_fr)
     result = m.align(audio_path, alignment_lyrics, language=language, original_split=True)
     segments = list(result.segments)
+    duplicate_range = _collapsed_adjacent_duplicate_range(segments)
+    if duplicate_range is not None:
+        print('Collapsed adjacent duplicate stanza detected; removing the extra copy...')
+        lines_fr, lines_ru, lines_tr = _remove_spoken_segment_range(
+            lines_fr,
+            lines_ru,
+            lines_tr,
+            duplicate_range,
+        )
+        n = len(lines_fr)
+        alignment_lyrics = _lyrics_for_alignment(lines_fr)
+        result = m.align(
+            audio_path,
+            alignment_lyrics,
+            language=language,
+            original_split=True,
+        )
+        segments = list(result.segments)
     segment_starts = [_segment_start(seg) for seg in segments]
     segment_ends = [_segment_end(seg) for seg in segments]
     duration = get_audio_duration(audio_path)
@@ -1170,7 +1454,7 @@ def align_multilang_lrc(
                 segment_starts = [_segment_start(seg) for seg in segments]
                 segment_ends = [_segment_end(seg) for seg in segments]
                 recovered_prefix = True
-        if not recovered_prefix and _needs_transcription_refinement(segments, duration):
+        if _needs_transcription_refinement(segments, duration):
             segment_starts, segment_ends = _refine_segment_boundaries(
                 segments,
                 transcription,
@@ -1194,6 +1478,12 @@ def align_multilang_lrc(
                 segment_ends[suffix_index:] = [
                     _segment_end(segment) for segment in suffix_segments
                 ]
+                segment_starts, segment_ends = _repair_collapsed_repeated_tail(
+                    segments,
+                    segment_starts,
+                    segment_ends,
+                    duration,
+                )
     segment_starts, segment_ends = _finalize_segment_boundaries(
         segment_starts, segment_ends, duration
     )
