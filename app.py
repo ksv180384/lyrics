@@ -526,6 +526,51 @@ def _recover_matches_before_large_gaps(
 
     return matches
 
+
+def _recover_matches_between_anchors(
+    segments: list,
+    matches: dict,
+    transcript_words: list,
+) -> dict:
+    """Fill short ordered lyric gaps between two strong transcription anchors."""
+    anchor_indices = sorted(matches)
+    for left, right in zip(anchor_indices, anchor_indices[1:]):
+        missing_count = right - left - 1
+        if not 1 <= missing_count <= 8:
+            continue
+        left_end = matches[left][2]
+        right_start = matches[right][1]
+        if right_start <= left_end or right_start - left_end > 60.0:
+            continue
+
+        recovered = {}
+        cursor = left_end
+        for index in range(left + 1, right):
+            candidates = [
+                candidate
+                for candidate in _transcription_candidates(
+                    segments[index], transcript_words
+                )
+                if (
+                    candidate[2] >= 0.90
+                    and candidate[4] - candidate[3] <= 10.0
+                    and candidate[3] >= cursor - 0.15
+                    and candidate[4] <= right_start + 0.15
+                )
+            ]
+            if not candidates:
+                recovered = {}
+                break
+            candidate = min(
+                candidates,
+                key=lambda value: (value[3], -value[2], value[4]),
+            )
+            _, _, similarity, start, end = candidate
+            recovered[index] = (similarity, start, end)
+            cursor = end
+        matches.update(recovered)
+    return matches
+
 def _collapsed_adjacent_duplicate_range(segments: list):
     """Find a second adjacent stanza copy that collapsed during alignment."""
     normalized = [_normalize_for_match(segment.text) for segment in segments]
@@ -1226,16 +1271,30 @@ def _repair_repeated_blocks_before_late_anchor(
     return starts, ends
 
 
-def _refine_segment_boundaries(segments: list, transcription, duration: float) -> tuple:
+def _refine_segment_boundaries(
+    segments: list,
+    transcription,
+    duration: float,
+    retry_start_override=None,
+) -> tuple:
     """Уточняет границы сегментов по уверенным совпадениям проверочной транскрипции."""
     transcript_words = [word for segment in transcription.segments for word in (getattr(segment, 'words', None) or []) if getattr(word, 'word', '').strip()]
-    retry_start = _collapsed_transcription_retry_start(segments)
+    retry_start = (
+        _collapsed_transcription_retry_start(segments)
+        if retry_start_override is None
+        else retry_start_override
+    )
     matches = _ordered_transcription_matches(
         segments,
         transcript_words,
         allow_far_from=retry_start,
     )
     matches = _recover_matches_before_large_gaps(
+        segments,
+        matches,
+        transcript_words,
+    )
+    matches = _recover_matches_between_anchors(
         segments,
         matches,
         transcript_words,
@@ -1307,11 +1366,39 @@ def _refine_segment_boundaries(segments: list, transcription, duration: float) -
         ends,
         duration,
     )
-    return _repair_repeated_blocks_before_late_anchor(
+    starts, ends = _repair_repeated_blocks_before_late_anchor(
         segments,
         starts,
         ends,
     )
+    if retry_start_override is not None:
+        # For a confirmed long intro the transcription is the only reliable
+        # clock. Later cadence repairs must not move its strong anchors back
+        # into instrumental gaps.
+        if 0 not in matches and matches:
+            first_anchor = min(start for _, start, _ in matches.values())
+            opening_candidates = [
+                candidate
+                for candidate in _transcription_candidates(
+                    segments[0], transcript_words
+                )
+                if (
+                    candidate[2] >= 0.90
+                    and candidate[4] - candidate[3] <= 10.0
+                    and first_anchor - 15.0 <= candidate[3] <= first_anchor
+                )
+            ]
+            if opening_candidates:
+                _, _, similarity, start, end = min(
+                    opening_candidates,
+                    key=lambda candidate: candidate[3],
+                )
+                matches[0] = (similarity, start, end)
+        for index, (similarity, start, end) in matches.items():
+            if similarity >= 0.90 and end - start <= 10.0:
+                starts[index] = start
+                ends[index] = end
+    return starts, ends
 
 
 def _broken_suffix_start(
@@ -1661,6 +1748,12 @@ def _collapsed_prefix_retry_offset(segments: list, transcription) -> float:
     first_reliable_start = min(clustered_starts or [
         start for _, start in candidate_points
     ])
+    # Most broken intros need only a short retry (and clipping farther can skip
+    # vocals that transcription missed, as in Garou). A clearly confirmed
+    # minute-long instrumental opening is different: keeping the 20-second cap
+    # would leave most of the instrumental audio in front of the lyrics again.
+    if first_reliable_start >= 60.0:
+        return min(90.0, max(0.0, first_reliable_start - 3.0))
     return min(20.0, max(0.0, first_reliable_start - 10.0))
 
 
@@ -1708,6 +1801,34 @@ def _realign_after_collapsed_prefix(
             os.remove(clipped_path)
         except OSError:
             pass
+
+
+def _merge_recovered_singletons(
+    starts: list,
+    ends: list,
+    recovered_segments: list,
+    matches: dict,
+) -> tuple:
+    """Use local alignment for one transcript-missed line between two anchors."""
+    if len(recovered_segments) != len(starts):
+        return starts, ends
+    for index in range(1, len(starts) - 1):
+        if (
+            index in matches
+            or index - 1 not in matches
+            or index + 1 not in matches
+        ):
+            continue
+        left_end = matches[index - 1][2]
+        right_start = matches[index + 1][1]
+        if right_start - left_end <= 12.0:
+            continue
+        recovered_start = _segment_start(recovered_segments[index])
+        recovered_end = _segment_end(recovered_segments[index])
+        if left_end <= recovered_start < recovered_end <= right_start:
+            starts[index] = recovered_start
+            ends[index] = recovered_end
+    return starts, ends
 
 
 def _build_line_start_times(
@@ -1883,28 +2004,57 @@ def align_multilang_lrc(
                 original_split=True,
             )
             segments = list(result.segments)
-        recovered_prefix = False
+        long_intro_refined = False
         if _has_severely_collapsed_prefix(segments, transcription):
-            print('Collapsed lyric prefix detected; retrying after the instrumental intro...')
-            recovered = _realign_after_collapsed_prefix(
-                m,
-                audio_path,
-                alignment_lyrics,
-                language,
-                segments,
-                transcription,
-            )
-            if recovered is not None:
-                segments = list(recovered.segments)
-                segment_starts = [_segment_start(seg) for seg in segments]
-                segment_ends = [_segment_end(seg) for seg in segments]
-                recovered_prefix = True
-        if _needs_transcription_refinement(segments, duration):
+            retry_offset = _collapsed_prefix_retry_offset(segments, transcription)
+            if retry_offset > 20.0:
+                print('Long instrumental intro detected; using transcription anchors...')
+                segment_starts, segment_ends = _refine_segment_boundaries(
+                    segments,
+                    transcription,
+                    duration,
+                    retry_start_override=(
+                        _collapsed_transcription_retry_start(segments)
+                    ),
+                )
+                local_recovery = _realign_after_collapsed_prefix(
+                    m,
+                    audio_path,
+                    alignment_lyrics,
+                    language,
+                    segments,
+                    transcription,
+                )
+                if local_recovery is not None:
+                    segment_starts, segment_ends = _merge_recovered_singletons(
+                        segment_starts,
+                        segment_ends,
+                        list(local_recovery.segments),
+                        verification_matches,
+                    )
+                long_intro_refined = True
+            else:
+                print('Collapsed lyric prefix detected; retrying after the instrumental intro...')
+                recovered = _realign_after_collapsed_prefix(
+                    m,
+                    audio_path,
+                    alignment_lyrics,
+                    language,
+                    segments,
+                    transcription,
+                )
+                if recovered is not None:
+                    segments = list(recovered.segments)
+                    segment_starts = [_segment_start(seg) for seg in segments]
+                    segment_ends = [_segment_end(seg) for seg in segments]
+        needs_refinement = _needs_transcription_refinement(segments, duration)
+        if needs_refinement and not long_intro_refined:
             segment_starts, segment_ends = _refine_segment_boundaries(
                 segments,
                 transcription,
                 duration,
             )
+        if needs_refinement and not long_intro_refined:
             recovered_suffix = _realign_broken_suffix(
                 m,
                 audio_path,

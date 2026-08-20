@@ -24,6 +24,8 @@ from app import (
     _repair_earlier_repeated_text_blocks,
     _late_tail_block_start,
     _repair_untrusted_ranges,
+    _recover_matches_between_anchors,
+    _merge_recovered_singletons,
     _segment_end,
     _segment_start,
 )
@@ -421,6 +423,69 @@ class RepeatedBlockRepairTests(unittest.TestCase):
             _collapsed_prefix_retry_offset(segments, transcription),
             20.0,
         )
+
+    def test_retries_near_confirmed_minute_long_instrumental_intro(self):
+        segments = [
+            SimpleNamespace(
+                text="elle tu laimes",
+                start=1.2,
+                end=5.58,
+                words=[],
+            )
+        ]
+        transcription = SimpleNamespace(
+            segments=[
+                SimpleNamespace(
+                    words=[
+                        SimpleNamespace(word="elle", start=69.32, end=70.0),
+                        SimpleNamespace(word=" tu", start=70.0, end=70.3),
+                        SimpleNamespace(word=" l'aimes", start=70.3, end=71.2),
+                    ]
+                )
+            ]
+        )
+
+        self.assertAlmostEqual(
+            _collapsed_prefix_retry_offset(segments, transcription),
+            66.32,
+            places=2,
+        )
+
+    def test_recovers_line_omitted_between_transcription_anchors(self):
+        segments = [
+            SimpleNamespace(text="left anchor", start=10.0, end=11.0, words=[]),
+            SimpleNamespace(text="en plein soleil", start=20.0, end=21.0, words=[]),
+            SimpleNamespace(text="right anchor", start=40.0, end=41.0, words=[]),
+        ]
+        words = [
+            SimpleNamespace(word="en", start=15.0, end=15.4),
+            SimpleNamespace(word=" plein", start=15.4, end=16.0),
+            SimpleNamespace(word=" soleil", start=16.0, end=17.0),
+        ]
+
+        matches = _recover_matches_between_anchors(
+            segments,
+            {0: (1.0, 10.0, 11.0), 2: (1.0, 40.0, 41.0)},
+            words,
+        )
+
+        self.assertEqual(matches[1], (1.0, 15.0, 17.0))
+
+    def test_merges_locally_aligned_single_line_inside_large_gap(self):
+        recovered = [
+            SimpleNamespace(text="left", start=10.0, end=11.0, words=[]),
+            SimpleNamespace(text="missing", start=15.0, end=17.0, words=[]),
+            SimpleNamespace(text="right", start=40.0, end=41.0, words=[]),
+        ]
+        starts, ends = _merge_recovered_singletons(
+            [10.0, 25.0, 40.0],
+            [11.0, 26.0, 41.0],
+            recovered,
+            {0: (1.0, 10.0, 11.0), 2: (1.0, 40.0, 41.0)},
+        )
+
+        self.assertEqual(starts, [10.0, 15.0, 40.0])
+        self.assertEqual(ends, [11.0, 17.0, 41.0])
 
     def test_ignores_isolated_early_match_when_choosing_retry_offset(self):
         segments = [
