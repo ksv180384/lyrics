@@ -1068,6 +1068,74 @@ def _repair_repeated_text_blocks(
     return starts, ends
 
 
+def _repair_earlier_repeated_text_blocks(
+    segments: list,
+    starts: list,
+    ends: list,
+    trusted: set = None,
+) -> tuple:
+    """Use a healthy later repeat to repair an earlier collapsed occurrence."""
+    trusted = trusted or set()
+    normalized = [_normalize_for_match(segment.text) for segment in segments]
+    for destination in range(len(segments) - 3):
+        best = None
+        for source in range(destination + 1, len(segments) - 2):
+            length = 0
+            while (
+                destination + length < source
+                and source + length < len(segments)
+                and normalized[destination + length]
+                == normalized[source + length]
+            ):
+                length += 1
+            if length < 3:
+                continue
+            source_deltas = [
+                starts[index + 1] - starts[index]
+                for index in range(source, source + length - 1)
+            ]
+            if any(delta < 0.5 or delta > 12.0 for delta in source_deltas):
+                continue
+            candidate = (length, -source, source, source_deltas)
+            if best is None or candidate[:2] > best[:2]:
+                best = candidate
+
+        if best is None:
+            continue
+        length, _, source, source_deltas = best
+        last = destination + length - 1
+        if destination not in trusted or last not in trusted:
+            continue
+        destination_deltas = [
+            starts[index + 1] - starts[index]
+            for index in range(destination, last)
+        ]
+        if not any(
+            destination_delta < source_delta * 0.55
+            or destination_delta > source_delta * 1.8
+            for destination_delta, source_delta in zip(
+                destination_deltas,
+                source_deltas,
+            )
+        ):
+            continue
+
+        source_span = starts[source + length - 1] - starts[source]
+        destination_span = starts[last] - starts[destination]
+        if source_span <= 0 or destination_span <= 0:
+            continue
+        scale = destination_span / source_span
+        destination_start = starts[destination]
+        for offset in range(1, length - 1):
+            index = destination + offset
+            starts[index] = destination_start + (
+                starts[source + offset] - starts[source]
+            ) * scale
+        for index in range(destination, last):
+            ends[index] = min(max(ends[index], starts[index]), starts[index + 1])
+    return starts, ends
+
+
 def _repair_repeated_blocks_before_late_anchor(
     segments: list,
     starts: list,
@@ -1227,6 +1295,12 @@ def _refine_segment_boundaries(segments: list, transcription, duration: float) -
         ends,
         trusted,
     )
+    starts, ends = _repair_earlier_repeated_text_blocks(
+        segments,
+        starts,
+        ends,
+        trusted,
+    )
     starts, ends = _repair_collapsed_repeated_tail(
         segments,
         starts,
@@ -1276,6 +1350,75 @@ def _broken_suffix_start(
         return None
     _, right = max(gaps)
     return max(1, right - 1)
+
+
+def _late_tail_block_start(segments: list):
+    """Find a short final lyric block after a long omitted-vocal/instrumental gap."""
+    candidates = [
+        index
+        for index in range(1, len(segments))
+        if (
+            3 <= len(segments) - index <= 8
+            and _segment_start(segments[index])
+            - _segment_end(segments[index - 1]) > 8.0
+        )
+    ]
+    return candidates[-1] if candidates else None
+
+
+def _realign_late_tail_block(
+    model,
+    audio_path: str,
+    language: str,
+    segments: list,
+) -> list:
+    """Realign only a short final block so preceding omitted vocals cannot trap it."""
+    tail_index = _late_tail_block_start(segments)
+    if tail_index is None:
+        return segments
+    previous_end = _segment_end(segments[tail_index - 1])
+    offset = max(0.0, previous_end + 2.0)
+    tail_lyrics = '\n'.join(
+        str(segment.text).strip()
+        for segment in segments[tail_index:]
+    )
+    handle = tempfile.NamedTemporaryFile(suffix='.wav', delete=False)
+    clipped_path = handle.name
+    handle.close()
+    try:
+        subprocess.run(
+            [
+                'ffmpeg', '-y', '-ss', f'{offset:.3f}', '-i', audio_path,
+                '-map', '0:a:0', '-vn', '-c:a', 'pcm_s16le', clipped_path,
+            ],
+            capture_output=True,
+            check=True,
+        )
+        recovered = model.align(
+            clipped_path,
+            tail_lyrics,
+            language=language,
+            original_split=True,
+        )
+        if recovered is None:
+            return segments
+        recovered.offset_time(offset)
+        tail = list(recovered.segments)
+        if len(tail) != len(segments) - tail_index:
+            return segments
+        starts = [_segment_start(segment) for segment in tail]
+        if (
+            starts[0] < previous_end
+            or starts[0] > _segment_start(segments[tail_index]) + 3.0
+            or any(current < previous for previous, current in zip(starts, starts[1:]))
+        ):
+            return segments
+        return [*segments[:tail_index], *tail]
+    finally:
+        try:
+            os.remove(clipped_path)
+        except OSError:
+            pass
 
 
 def _realign_broken_suffix(
@@ -1336,6 +1479,12 @@ def _realign_broken_suffix(
             )
         ):
             return None
+        recovered_segments = _realign_late_tail_block(
+            model,
+            audio_path,
+            language,
+            recovered_segments,
+        )
         return suffix_index, recovered_segments
     finally:
         try:
@@ -1407,7 +1556,64 @@ def _needs_transcription_refinement(segments: list, duration: float) -> bool:
     return duration - reliable_end > max(20.0, duration * 0.15)
 
 
-def _has_severely_collapsed_prefix(segments: list) -> bool:
+def _has_displaced_repeated_prefix(segments: list, matches: dict) -> bool:
+    """Detect an opening stanza aligned before its first audible refrain word."""
+    normalized = [_normalize_for_match(segment.text) for segment in segments]
+    repeated_indices = [
+        line_index
+        for line_index, text in enumerate(normalized)
+        if line_index >= 3 and text and text in normalized[:line_index]
+    ]
+    for line_index in repeated_indices:
+        repeated_start = _segment_start(segments[line_index])
+        first_copy = normalized[:line_index].index(normalized[line_index])
+        next_start = (
+            _segment_start(segments[line_index + 1])
+            if line_index + 1 < len(segments)
+            else repeated_start
+        )
+        next_match = matches.get(line_index + 1)
+        if next_match is not None and next_match[2] - next_match[1] <= 10:
+            next_start = max(next_start, next_match[1])
+        # In the broken Garou alignment the first stanza fills the instrumental
+        # intro, its repeated cue lands on the first real "Gitan", and the next
+        # line jumps thirty seconds to the second stanza. This shape is useful
+        # even when Whisper turns the intro into one unusably long word.
+        if (
+            line_index + 1 < len(segments)
+            and _segment_start(segments[first_copy]) < 5
+            and repeated_start >= 15
+            and _segment_end(segments[line_index - 1]) <= repeated_start + 1.5
+            and next_start - repeated_start > 15
+        ):
+            return True
+
+    if not matches:
+        return False
+    for line_index in sorted(matches):
+        if line_index < 3:
+            continue
+        text = normalized[line_index]
+        if not text or text not in normalized[:line_index]:
+            continue
+        # A trustworthy transcription match for a repeated cue (for example
+        # the second textual "Gitan") can actually be the first sung cue when
+        # forced alignment placed the whole preceding stanza in an instrumental
+        # intro. Any earlier transcription anchor would disprove that pattern.
+        if any(index < line_index for index in matches):
+            continue
+        _, matched_start, _ = matches[line_index]
+        if matched_start < 15:
+            continue
+        if _segment_end(segments[line_index - 1]) > matched_start + 1.5:
+            continue
+        if matched_start - _segment_start(segments[0]) < 10:
+            continue
+        return True
+    return False
+
+
+def _has_severely_collapsed_prefix(segments: list, transcription=None) -> bool:
     """Detect when many opening lyric lines were squeezed into the intro."""
     prefix = segments[:min(12, len(segments))]
     if len(prefix) < 8:
@@ -1430,7 +1636,22 @@ def _has_severely_collapsed_prefix(segments: list) -> bool:
         for segment in prefix
         if _segment_end(segment) - _segment_start(segment) <= 0.25
     )
-    return collapsed >= 4 and starts[-1] - starts[0] <= 20
+    if collapsed >= 4 and starts[-1] - starts[0] <= 20:
+        return True
+    if transcription is None:
+        return False
+    transcript_words = [
+        word
+        for segment in transcription.segments
+        for word in (getattr(segment, 'words', None) or [])
+        if getattr(word, 'word', '').strip()
+    ]
+    matches = _ordered_transcription_matches(
+        segments,
+        transcript_words,
+        allow_far_from=_collapsed_transcription_retry_start(segments),
+    )
+    return _has_displaced_repeated_prefix(segments, matches)
 
 
 def _collapsed_prefix_retry_offset(segments: list, transcription) -> float:
@@ -1685,7 +1906,7 @@ def align_multilang_lrc(
             )
             segments = list(result.segments)
         recovered_prefix = False
-        if _has_severely_collapsed_prefix(segments):
+        if _has_severely_collapsed_prefix(segments, transcription):
             print('Collapsed lyric prefix detected; retrying after the instrumental intro...')
             recovered = _realign_after_collapsed_prefix(
                 m,

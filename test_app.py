@@ -13,6 +13,7 @@ from app import (
     _is_section_label,
     _lyrics_for_alignment,
     _collapsed_prefix_retry_offset,
+    _has_displaced_repeated_prefix,
     _has_severely_collapsed_prefix,
     _ordered_transcription_matches,
     _repair_collapsed_segments_before_late_groups,
@@ -20,6 +21,8 @@ from app import (
     _repair_collapsed_repeated_tail,
     _repair_patterned_refrain_blocks,
     _repair_repeated_text_blocks,
+    _repair_earlier_repeated_text_blocks,
+    _late_tail_block_start,
     _repair_untrusted_ranges,
     _segment_end,
     _segment_start,
@@ -27,6 +30,27 @@ from app import (
 
 
 class RepeatedBlockRepairTests(unittest.TestCase):
+    def test_repairs_earlier_repeat_from_healthy_later_cadence(self):
+        block = ["line a", "line b", "line c", "line d"]
+        texts = [*block, "middle", *block]
+        starts = [94.58, 95.69, 96.80, 103.92, 120.0, 160.22, 162.98, 165.74, 169.18]
+        ends = [start + 1.0 for start in starts]
+        segments = [
+            SimpleNamespace(text=text, start=start, end=end, words=[])
+            for text, start, end in zip(texts, starts, ends)
+        ]
+
+        repaired, _ = _repair_earlier_repeated_text_blocks(
+            segments,
+            starts.copy(),
+            ends.copy(),
+            trusted={0, 3},
+        )
+
+        expected = [94.58, 97.46, 100.33, 103.92]
+        for actual, target in zip(repaired[:4], expected):
+            self.assertAlmostEqual(actual, target, places=2)
+
     def test_restores_coherent_raw_repeat_after_isolated_early_match(self):
         block = ["line a", "line b", "line c", "line d"]
         texts = [*block, "middle", *block, "tail"]
@@ -302,6 +326,45 @@ class RepeatedBlockRepairTests(unittest.TestCase):
         )
 
         self.assertFalse(_has_severely_collapsed_prefix(segments))
+
+    def test_detects_opening_stanza_displaced_before_first_sung_repeat(self):
+        texts = [
+            "Gitan",
+            "Je revais enfant de vivre libre comme un gitan",
+            "Je voyais des plages de sable noir",
+            "Et je dessinais dans mes cahiers",
+            "Des montagnes d'Espagne",
+            "Gitan",
+            "Quand plus tard j'apprenais mes premiers accords",
+        ]
+        starts = [1.88, 9.07, 13.37, 19.02, 23.32, 25.50, 56.00]
+        ends = [2.38, 13.12, 18.77, 23.07, 24.82, 25.84, 61.12]
+        segments = [
+            SimpleNamespace(text=text, start=start, end=end, words=[])
+            for text, start, end in zip(texts, starts, ends)
+        ]
+
+        self.assertTrue(
+            _has_displaced_repeated_prefix(
+                segments,
+                {5: (1.0, 25.24, 25.74), 6: (0.98, 56.00, 61.12)},
+            )
+        )
+
+    def test_keeps_prefix_when_an_earlier_line_has_transcription_anchor(self):
+        segments = [
+            SimpleNamespace(text="Gitan", start=1.88, end=2.38, words=[]),
+            SimpleNamespace(text="opening line", start=9.07, end=13.12, words=[]),
+            SimpleNamespace(text="another line", start=13.37, end=18.77, words=[]),
+            SimpleNamespace(text="Gitan", start=25.50, end=25.84, words=[]),
+        ]
+
+        self.assertFalse(
+            _has_displaced_repeated_prefix(
+                segments,
+                {0: (1.0, 1.88, 2.38), 3: (1.0, 25.50, 25.84)},
+            )
+        )
 
     def test_caps_intro_retry_at_twenty_seconds(self):
         segments = [
@@ -676,6 +739,15 @@ class BrokenSuffixRecoveryTests(unittest.TestCase):
         self.assertLess(starts[-1], 218.54)
         self.assertEqual(ends[-1], 218.54)
         self.assertEqual(starts, sorted(starts))
+
+    def test_finds_short_final_block_after_long_gap(self):
+        starts = [0.0, 10.0, 12.0, 14.0, 30.0, 33.0, 36.0, 39.0]
+        segments = [
+            SimpleNamespace(text=str(index), start=start, end=start + 1.0, words=[])
+            for index, start in enumerate(starts)
+        ]
+
+        self.assertEqual(_late_tail_block_start(segments), 4)
 
 
 if __name__ == "__main__":
