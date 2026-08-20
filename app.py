@@ -1588,28 +1588,6 @@ def _has_displaced_repeated_prefix(segments: list, matches: dict) -> bool:
         ):
             return True
 
-    if not matches:
-        return False
-    for line_index in sorted(matches):
-        if line_index < 3:
-            continue
-        text = normalized[line_index]
-        if not text or text not in normalized[:line_index]:
-            continue
-        # A trustworthy transcription match for a repeated cue (for example
-        # the second textual "Gitan") can actually be the first sung cue when
-        # forced alignment placed the whole preceding stanza in an instrumental
-        # intro. Any earlier transcription anchor would disprove that pattern.
-        if any(index < line_index for index in matches):
-            continue
-        _, matched_start, _ = matches[line_index]
-        if matched_start < 15:
-            continue
-        if _segment_end(segments[line_index - 1]) > matched_start + 1.5:
-            continue
-        if matched_start - _segment_start(segments[0]) < 10:
-            continue
-        return True
     return False
 
 

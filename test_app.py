@@ -366,6 +366,30 @@ class RepeatedBlockRepairTests(unittest.TestCase):
             )
         )
 
+    def test_keeps_coherent_opening_when_transcription_starts_late(self):
+        texts = [
+            "La place Rouge etait vide",
+            "Devant moi marchait Nathalie",
+            "Il avait un joli nom mon guide",
+            "Nathalie",
+            "La place Rouge etait blanche",
+            "La neige faisait un tapis",
+            "Et je suivais par ce froid dimanche",
+            "Nathalie",
+        ]
+        starts = [7.24, 10.22, 14.04, 18.60, 20.62, 25.06, 28.68, 32.96]
+        segments = [
+            SimpleNamespace(text=text, start=start, end=start + 1.0, words=[])
+            for text, start in zip(texts, starts)
+        ]
+
+        self.assertFalse(
+            _has_displaced_repeated_prefix(
+                segments,
+                {7: (1.0, 33.00, 33.50)},
+            )
+        )
+
     def test_caps_intro_retry_at_twenty_seconds(self):
         segments = [
             SimpleNamespace(
