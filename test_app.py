@@ -3,6 +3,7 @@ from types import SimpleNamespace
 
 from app import (
     _collapsed_adjacent_duplicate_range,
+    _collapsed_unmatched_repeated_range,
     _collapsed_transcription_retry_start,
     _remove_spoken_segment_range,
     _repair_repeated_blocks_before_late_anchor,
@@ -17,6 +18,7 @@ from app import (
     _repair_collapsed_segments_before_late_groups,
     _repair_repeated_segment_starts,
     _repair_collapsed_repeated_tail,
+    _repair_patterned_refrain_blocks,
     _repair_repeated_text_blocks,
     _repair_untrusted_ranges,
     _segment_end,
@@ -25,6 +27,68 @@ from app import (
 
 
 class RepeatedBlockRepairTests(unittest.TestCase):
+    def test_restores_coherent_raw_repeat_after_isolated_early_match(self):
+        block = ["line a", "line b", "line c", "line d"]
+        texts = [*block, "middle", *block, "tail"]
+        source = [0.56, 3.70, 7.00, 10.24]
+        raw_repeat = [208.80, 211.82, 214.48, 220.00]
+        forced = [*source, 30.0, *raw_repeat, 223.02]
+        ends = [start + 1.0 for start in forced]
+        segments = [
+            SimpleNamespace(text=text, start=start, end=end, words=[])
+            for text, start, end in zip(texts, forced, ends)
+        ]
+        refined = [*source, 30.0, 208.80, 211.82, 212.78, 220.00, 223.02]
+
+        repaired_starts, _ = _repair_repeated_text_blocks(
+            segments,
+            refined,
+            ends.copy(),
+        )
+
+        self.assertEqual(repaired_starts[5:9], raw_repeat)
+
+    def test_keeps_first_forced_onset_when_rest_of_repeat_collapses(self):
+        block = [
+            "Si tu savais comme on s'ennuie",
+            "A la Manic",
+            "Tu m'ecrirais bien plus souvent",
+            "A la Manicouagan",
+        ]
+        texts = [*block, "middle", *block, "tail"]
+        source = [0.56, 3.70, 7.00, 10.24]
+        raw_repeat = [164.18, 164.36, 164.36, 179.76]
+        forced = [*source, 30.0, *raw_repeat, 182.10]
+        raw_ends = [
+            2.50, 5.00, 9.00, 12.00, 31.00,
+            164.36, 164.36, 164.36, 181.00, 183.00,
+        ]
+        refined = [
+            *source,
+            30.0,
+            172.71, 175.66, 177.26, 179.76,
+            182.10,
+        ]
+        segments = [
+            SimpleNamespace(text=text, start=start, end=end, words=[])
+            for text, start, end in zip(texts, forced, raw_ends)
+        ]
+
+        repaired_starts, repaired_ends = _repair_repeated_text_blocks(
+            segments,
+            refined.copy(),
+            raw_ends.copy(),
+        )
+        repaired_starts, _ = _repair_repeated_blocks_before_late_anchor(
+            segments,
+            repaired_starts,
+            repaired_ends,
+        )
+
+        expected = [164.18, 167.32, 170.62, 173.86]
+        for actual, target in zip(repaired_starts[5:9], expected):
+            self.assertAlmostEqual(actual, target, places=2)
+
     def test_chooses_consistent_late_cluster_for_broken_repeat(self):
         chorus = ["line a", "line b", "line c", "line d", "line e", "line f", "line g", "line h"]
         source_starts = [54.38, 56.20, 57.88, 59.76, 61.92, 63.74, 65.56, 67.24]
@@ -432,6 +496,43 @@ class AdjacentDuplicateStanzaTests(unittest.TestCase):
         self.assertEqual(_collapsed_transcription_retry_start(segments), 1)
 
 
+class UnmatchedRepeatedStanzaTests(unittest.TestCase):
+    def test_finds_collapsed_repeat_skipped_by_transcription(self):
+        block = ["line a", "line b", "line c", "line d"]
+        texts = [*block, "middle", *block, "confirmed next line"]
+        starts = [
+            0.5, 3.7, 7.0, 10.2, 30.0,
+            164.18, 164.36, 164.36, 179.76, 182.10,
+        ]
+        ends = [
+            2.5, 5.5, 9.0, 12.0, 31.0,
+            164.36, 164.36, 164.36, 181.0, 184.0,
+        ]
+        segments = [
+            SimpleNamespace(text=text, start=start, end=end, words=[])
+            for text, start, end in zip(texts, starts, ends)
+        ]
+
+        self.assertEqual(
+            _collapsed_unmatched_repeated_range(segments, {9}),
+            (5, 9),
+        )
+
+    def test_preserves_repeat_when_transcription_confirms_any_line(self):
+        block = ["line a", "line b", "line c"]
+        texts = [*block, "middle", *block, "confirmed next line"]
+        starts = [0.5, 3.5, 6.5, 20.0, 30.0, 30.1, 30.1, 40.0]
+        ends = [2.0, 5.0, 8.0, 21.0, 30.1, 30.1, 30.1, 41.0]
+        segments = [
+            SimpleNamespace(text=text, start=start, end=end, words=[])
+            for text, start, end in zip(texts, starts, ends)
+        ]
+
+        self.assertIsNone(
+            _collapsed_unmatched_repeated_range(segments, {4, 7})
+        )
+
+
 class LateAnchorRepeatedBlockTests(unittest.TestCase):
     def test_moves_collapsed_repeat_next_to_following_anchor(self):
         texts = ["lead", "a", "b", "c", "anchor", "middle", "a", "b", "c", "late"]
@@ -468,6 +569,55 @@ class LateAnchorRepeatedBlockTests(unittest.TestCase):
         )
 
         self.assertEqual(repaired_starts, starts)
+
+
+class PatternedRefrainTests(unittest.TestCase):
+    def test_restores_two_part_refrain_from_trusted_opening_cadence(self):
+        short = "Ou t'es papa, ou t'es"
+        long = "Ou t'es, ou t'es, ou, papa, ou t'es"
+        texts = [short, short, short, long, short, short, short, long, "Ou t'es"]
+        starts = [48.44, 50.82, 52.30, 59.08, 61.38, 63.68, 65.98, 72.48, 76.60]
+        ends = [start + 1.0 for start in starts]
+        segments = [
+            SimpleNamespace(text=text, start=start, end=end, words=[])
+            for text, start, end in zip(texts, starts, ends)
+        ]
+
+        repaired_starts, _ = _repair_patterned_refrain_blocks(
+            segments,
+            starts.copy(),
+            ends.copy(),
+            trusted={0, 1, 2},
+        )
+
+        expected = [48.44, 50.37, 52.30, 54.23, 56.66, 58.59, 60.52, 62.45, 64.88]
+        for actual, target in zip(repaired_starts, expected):
+            self.assertAlmostEqual(actual, target, places=2)
+
+    def test_uses_forced_opening_when_repeated_block_has_no_trusted_anchor(self):
+        short = "Ou t'es papa, ou t'es"
+        long = "Ou t'es, ou t'es, ou, papa, ou t'es"
+        pattern = [short, short, short, long, short, short, short, long, "Ou t'es"]
+        texts = [*pattern, "bridge", *pattern]
+        source = [48.44, 50.82, 52.30, 59.08, 61.38, 63.68, 65.98, 72.48, 76.60]
+        forced_repeat = [114.36, 118.66, 121.48, 125.20, 127.24, 129.14, 131.70, 139.70, 148.14]
+        starts = [*source, 90.0, *forced_repeat]
+        ends = [start + 1.0 for start in starts]
+        segments = [
+            SimpleNamespace(text=text, start=start, end=end, words=[])
+            for text, start, end in zip(texts, starts, ends)
+        ]
+
+        repaired_starts, _ = _repair_patterned_refrain_blocks(
+            segments,
+            starts.copy(),
+            ends.copy(),
+            trusted={0, 1, 2},
+        )
+
+        self.assertAlmostEqual(repaired_starts[10], 114.36, places=2)
+        self.assertAlmostEqual(repaired_starts[13], 120.15, places=2)
+        self.assertAlmostEqual(repaired_starts[18], 130.80, places=2)
 
 
 class CollapsedRepeatedTailTests(unittest.TestCase):

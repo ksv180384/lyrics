@@ -549,6 +549,59 @@ def _collapsed_adjacent_duplicate_range(segments: list):
     return None
 
 
+def _collapsed_unmatched_repeated_range(
+    segments: list,
+    matched_indices: set,
+):
+    """Find an earlier stanza copy that is absent from this audio version."""
+    normalized = [_normalize_for_match(segment.text) for segment in segments]
+    for destination in range(3, len(segments) - 3):
+        best = None
+        for source in range(destination):
+            length = 0
+            while (
+                destination + length < len(segments)
+                and source + length < destination
+                and normalized[source + length]
+                == normalized[destination + length]
+            ):
+                length += 1
+            if length < 3:
+                continue
+            source_deltas = [
+                _segment_start(segments[index + 1])
+                - _segment_start(segments[index])
+                for index in range(source, source + length - 1)
+            ]
+            if any(delta < 0.5 or delta > 12.0 for delta in source_deltas):
+                continue
+            if len(set(normalized[destination:destination + length])) < length:
+                continue
+            candidate = (length, source)
+            if best is None or candidate > best:
+                best = candidate
+
+        if best is None:
+            continue
+        length, _ = best
+        raw_destination = segments[destination:destination + length]
+        collapsed = sum(
+            _segment_end(segment) - _segment_start(segment) <= 0.35
+            for segment in raw_destination
+        )
+        if collapsed < length - 1:
+            continue
+        if any(
+            index in matched_indices
+            for index in range(destination, destination + length)
+        ):
+            continue
+        if destination + length not in matched_indices:
+            continue
+        return destination, destination + length
+    return None
+
+
 def _remove_spoken_segment_range(
     lines_fr: list,
     lines_ru: list,
@@ -655,6 +708,94 @@ def _repair_repeated_segment_starts(
     return starts, ends
 
 
+def _repair_patterned_refrain_blocks(
+    segments: list,
+    starts: list,
+    ends: list,
+    trusted: set = None,
+) -> tuple:
+    """Restore A-A-A-B / A-A-A-B refrains from their reliable opening beat."""
+    trusted = trusted or set()
+    normalized = [_normalize_for_match(segment.text) for segment in segments]
+    blocks = []
+    index = 0
+    while index + 7 < len(segments):
+        short_line = normalized[index]
+        long_line = normalized[index + 3]
+        if (
+            len(short_line) >= 6
+            and len(long_line) >= 6
+            and normalized[index:index + 3] == [short_line] * 3
+            and normalized[index + 4:index + 7] == [short_line] * 3
+            and normalized[index + 7] == long_line
+            and long_line != short_line
+        ):
+            length = 8
+            if index + 8 < len(segments):
+                final_line = normalized[index + 8]
+                if (
+                    len(final_line) >= 5
+                    and (
+                        short_line.startswith(final_line)
+                        or final_line.startswith(short_line)
+                    )
+                ):
+                    length = 9
+            blocks.append((index, length))
+            index += length
+        else:
+            index += 1
+
+    if not blocks:
+        return starts, ends
+
+    cadence_candidates = []
+    for block_start, _ in blocks:
+        for left in (block_start, block_start + 1):
+            delta = starts[left + 1] - starts[left]
+            if left in trusted and left + 1 in trusted and 1.0 <= delta <= 3.0:
+                cadence_candidates.append(delta)
+    if not cadence_candidates:
+        return starts, ends
+    cadence = statistics.median(cadence_candidates)
+
+    for block_start, length in blocks:
+        trusted_count = sum(
+            index in trusted
+            for index in range(block_start, block_start + min(8, length))
+        )
+        anchor = (
+            starts[block_start]
+            if block_start in trusted
+            else _segment_start(segments[block_start])
+        )
+        offsets = [
+            0.0,
+            cadence,
+            cadence * 2,
+            cadence * 3,
+            cadence * 4 + 0.5,
+            cadence * 5 + 0.5,
+            cadence * 6 + 0.5,
+            cadence * 7 + 0.5,
+            cadence * 8 + 1.0,
+        ][:length]
+        expected = [anchor + offset for offset in offsets]
+        if trusted_count >= min(8, length) and max(
+            abs(starts[block_start + offset] - expected[offset])
+            for offset in range(length)
+        ) <= 1.0:
+            continue
+        for offset, expected_start in enumerate(expected):
+            starts[block_start + offset] = expected_start
+
+    for index in range(len(ends) - 1):
+        ends[index] = min(max(ends[index], starts[index]), starts[index + 1])
+    if ends:
+        ends[-1] = max(ends[-1], starts[-1])
+    return starts, ends
+
+
 def _repair_collapsed_repeated_tail(
     segments: list,
     starts: list,
@@ -755,6 +896,21 @@ def _repair_untrusted_ranges(
     return starts, ends
 
 
+def _has_usable_collapsed_repeat_anchor(segments: list) -> bool:
+    """Return whether a collapsed repeat still has a credible first onset."""
+    if len(segments) < 3:
+        return False
+    durations = [
+        _segment_end(segment) - _segment_start(segment)
+        for segment in segments
+    ]
+    collapsed = sum(duration <= 0.35 for duration in durations)
+    return (
+        0.05 <= durations[0] <= 0.35
+        and collapsed >= max(2, (len(segments) + 1) // 2)
+    )
+
+
 def _repair_repeated_text_blocks(
     segments: list,
     starts: list,
@@ -803,10 +959,38 @@ def _repair_repeated_text_blocks(
             starts[destination + i + 1] - starts[destination + i]
             for i in range(length - 1)
         ]
-        timing_is_broken = any(
-            destination_delta > 12
-            or (destination_delta < 0.5 and source_delta >= 0.75)
-            for source_delta, destination_delta in zip(source_deltas, destination_deltas)
+        raw_destination_deltas = [
+            forced_starts[destination + i + 1]
+            - forced_starts[destination + i]
+            for i in range(length - 1)
+        ]
+        refined_compression = any(
+            destination_delta < source_delta * 0.45
+            and raw_delta >= source_delta * 0.65
+            for source_delta, destination_delta, raw_delta in zip(
+                source_deltas,
+                destination_deltas,
+                raw_destination_deltas,
+            )
+        )
+        raw_repeat_is_coherent = all(
+            0.5 <= delta <= 12.0
+            for delta in raw_destination_deltas
+        )
+        anchored_collapsed_repeat = _has_usable_collapsed_repeat_anchor(
+            segments[destination:destination + length]
+        )
+        timing_is_broken = (
+            anchored_collapsed_repeat
+            or refined_compression
+            or any(
+                destination_delta > 12
+                or (destination_delta < 0.5 and source_delta >= 0.75)
+                for source_delta, destination_delta in zip(
+                    source_deltas,
+                    destination_deltas,
+                )
+            )
         )
         if not timing_is_broken:
             destination += 1
@@ -814,42 +998,62 @@ def _repair_repeated_text_blocks(
 
         source_start = starts[source]
         source_offsets = [starts[source + i] - source_start for i in range(length)]
+        if raw_repeat_is_coherent and refined_compression:
+            # A single transcription match can jump to an earlier repeated
+            # phrase and squeeze two otherwise healthy forced onsets together.
+            # In that case the internally coherent raw block is safer as-is.
+            for offset in range(length):
+                index = destination + offset
+                starts[index] = forced_starts[index]
+                ends[index] = _segment_end(segments[index])
+            destination += length
+            continue
         # A broken repeat can split into two plausible timing clusters: the
         # beginning may align to an early instrumental while the final lines
         # align to the real vocals. Infer a shared shift from the entire block.
-        shift_candidates = [
-            starts[destination + i] - starts[source + i]
-            for i in range(length)
-        ]
-        shift_tolerance = 1.0
-        ranked_shifts = []
-        source_gap_before = source_start - ends[source - 1] if source > 0 else None
-        for candidate_shift in shift_candidates:
-            inliers = [
-                shift
-                for shift in shift_candidates
-                if abs(shift - candidate_shift) <= shift_tolerance
+        if anchored_collapsed_repeat:
+            # Forced alignment often finds the first sung line of a repeated
+            # stanza and then collapses its next lines onto that same instant.
+            # Preserve that useful onset and copy only the proven source rhythm.
+            destination_start = forced_starts[destination]
+        else:
+            shift_candidates = [
+                starts[destination + i] - starts[source + i]
+                for i in range(length)
             ]
-            shift = statistics.median(inliers)
-            destination_start = source_start + shift
-            context_error = 0.0
-            if destination > 0 and source_gap_before is not None:
-                destination_gap_before = destination_start - ends[destination - 1]
-                context_error = abs(destination_gap_before - source_gap_before)
-            trusted_inliers = sum(
-                1
-                for offset, candidate in enumerate(shift_candidates)
-                if (
-                    destination + offset in trusted
-                    and abs(candidate - candidate_shift) <= shift_tolerance
+            shift_tolerance = 1.0
+            ranked_shifts = []
+            source_gap_before = (
+                source_start - ends[source - 1]
+                if source > 0
+                else None
+            )
+            for candidate_shift in shift_candidates:
+                inliers = [
+                    shift
+                    for shift in shift_candidates
+                    if abs(shift - candidate_shift) <= shift_tolerance
+                ]
+                shift = statistics.median(inliers)
+                destination_start = source_start + shift
+                context_error = 0.0
+                if destination > 0 and source_gap_before is not None:
+                    destination_gap_before = destination_start - ends[destination - 1]
+                    context_error = abs(destination_gap_before - source_gap_before)
+                trusted_inliers = sum(
+                    1
+                    for offset, candidate in enumerate(shift_candidates)
+                    if (
+                        destination + offset in trusted
+                        and abs(candidate - candidate_shift) <= shift_tolerance
+                    )
                 )
-            )
-            ranked_shifts.append(
-                (trusted_inliers, len(inliers), -context_error, shift)
-            )
+                ranked_shifts.append(
+                    (trusted_inliers, len(inliers), -context_error, shift)
+                )
 
-        _, _, _, block_shift = max(ranked_shifts)
-        destination_start = source_start + block_shift
+            _, _, _, block_shift = max(ranked_shifts)
+            destination_start = source_start + block_shift
         for offset in range(length):
             starts[destination + offset] = (
                 destination_start + source_offsets[offset]
@@ -889,6 +1093,10 @@ def _repair_repeated_blocks_before_late_anchor(
                     if destination + length >= len(segments):
                         continue
                     raw_destination = segments[destination:destination + length]
+                    if _has_usable_collapsed_repeat_anchor(raw_destination):
+                        # Its first forced onset is more direct evidence than
+                        # the distance from the following transcription anchor.
+                        continue
                     if not any(
                         _segment_end(segment) - _segment_start(segment) <= 0.35
                         for segment in raw_destination
@@ -1005,6 +1213,12 @@ def _refine_segment_boundaries(segments: list, transcription, duration: float) -
         starts,
         ends,
         duration,
+        trusted,
+    )
+    starts, ends = _repair_patterned_refrain_blocks(
+        segments,
+        starts,
+        ends,
         trusted,
     )
     starts, ends = _repair_repeated_text_blocks(
@@ -1438,6 +1652,38 @@ def align_multilang_lrc(
     if _needs_transcription_refinement(segments, duration):
         print('Suspicious alignment gap detected; verifying timestamps with transcription...')
         transcription = m.transcribe(audio_path, language=language, regroup=False)
+        transcript_words = [
+            word
+            for segment in transcription.segments
+            for word in (getattr(segment, 'words', None) or [])
+            if getattr(word, 'word', '').strip()
+        ]
+        verification_matches = _ordered_transcription_matches(
+            segments,
+            transcript_words,
+            allow_far_from=_collapsed_transcription_retry_start(segments),
+        )
+        unmatched_repeat = _collapsed_unmatched_repeated_range(
+            segments,
+            set(verification_matches),
+        )
+        if unmatched_repeat is not None:
+            print('Unsung repeated stanza detected; removing it from this audio version...')
+            lines_fr, lines_ru, lines_tr = _remove_spoken_segment_range(
+                lines_fr,
+                lines_ru,
+                lines_tr,
+                unmatched_repeat,
+            )
+            n = len(lines_fr)
+            alignment_lyrics = _lyrics_for_alignment(lines_fr)
+            result = m.align(
+                audio_path,
+                alignment_lyrics,
+                language=language,
+                original_split=True,
+            )
+            segments = list(result.segments)
         recovered_prefix = False
         if _has_severely_collapsed_prefix(segments):
             print('Collapsed lyric prefix detected; retrying after the instrumental intro...')
